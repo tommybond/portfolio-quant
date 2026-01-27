@@ -7,6 +7,14 @@ import json
 from datetime import datetime, timedelta
 import os
 
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    # python-dotenv not installed, environment variables must be set manually
+    pass
+
 # Set matplotlib backend before importing pyplot to avoid segfault
 import matplotlib
 matplotlib.use('Agg')
@@ -650,6 +658,26 @@ if INTEGRATIONS_AVAILABLE and "db_initialized" not in st.session_state:
     try:
         init_database()
         st.session_state.db_initialized = True
+        
+        # Create default admin user if it doesn't exist
+        try:
+            from database.models import User, create_session
+            db = create_session()
+            admin_user = db.query(User).filter(User.username == 'admin').first()
+            if not admin_user:
+                auth_manager = AuthManager(db)
+                admin_user = auth_manager.create_user(
+                    username='admin',
+                    email='admin@nashor.com',
+                    password='admin123',
+                    full_name='System Administrator',
+                    role='admin'
+                )
+                if admin_user:
+                    print("✅ Default admin user created: admin/admin123")
+            db.close()
+        except Exception as e:
+            print(f"Warning: Could not create default admin user: {e}")
     except Exception as e:
         st.warning(f"Database initialization warning: {e}")
 
@@ -688,15 +716,38 @@ if "risk_manager" not in st.session_state:
         
         # Initialize user session (default to guest mode if not authenticated)
         if INTEGRATIONS_AVAILABLE:
-            st.session_state.authenticated = False
-            st.session_state.current_user = None
-            st.session_state.user_role = "guest"
+            # Check if headless mode is enabled (skip login)
+            headless_mode = os.getenv('HEADLESS_LOGIN', 'false').lower() == 'true'
+            
+            # Initialize as not authenticated first
+            if "authenticated" not in st.session_state:
+                st.session_state.authenticated = False
+                st.session_state.current_user = None
+                st.session_state.user_role = "guest"
+            
+            # Auto-login with default admin credentials if headless mode enabled
+            if headless_mode and not st.session_state.get("authenticated", False):
+                try:
+                    if "auth_manager" not in st.session_state:
+                        st.session_state.auth_manager = AuthManager()
+                    auth_manager = st.session_state.auth_manager
+                    user = auth_manager.authenticate('admin', 'admin123')
+                    if user:
+                        st.session_state.authenticated = True
+                        st.session_state.current_user = user
+                        st.session_state.user_role = user.role
+                        st.session_state.user_id = user.id
+                except Exception as e:
+                    # If auto-login fails, keep as guest (will show login page)
+                    pass
     except Exception as e:
         st.error(f"Error initializing system: {str(e)}")
         st.stop()
 
 # Authentication Check (if integrations available)
-if INTEGRATIONS_AVAILABLE and not st.session_state.get("authenticated", False):
+# Skip login page if headless mode is enabled and already authenticated
+headless_mode = os.getenv('HEADLESS_LOGIN', 'false').lower() == 'true'
+if INTEGRATIONS_AVAILABLE and not st.session_state.get("authenticated", False) and not headless_mode:
     # Login page
     st.title("🔐 Login to Nashor Portfolio Quant")
     
@@ -711,22 +762,51 @@ if INTEGRATIONS_AVAILABLE and not st.session_state.get("authenticated", False):
             login_tab, register_tab = st.tabs(["Login", "Register"])
             
             with login_tab:
-                username = st.text_input("Username", key="login_username")
+                # Show default credentials hint
+                st.info("💡 **Default Credentials**: username: `admin`, password: `admin123`")
+                
+                username = st.text_input("Username", value="admin", key="login_username")
                 password = st.text_input("Password", type="password", key="login_password")
                 
                 if st.button("Login", type="primary", use_container_width=True):
-                    auth_manager = st.session_state.auth_manager
-                    user = auth_manager.authenticate(username, password)
-                    
-                    if user:
-                        st.session_state.authenticated = True
-                        st.session_state.current_user = user
-                        st.session_state.user_role = user.role
-                        st.session_state.user_id = user.id
-                        st.success("✅ Login successful!")
-                        st.rerun()
-                    else:
-                        st.error("❌ Invalid username or password")
+                    try:
+                        # Ensure auth_manager is initialized
+                        if "auth_manager" not in st.session_state:
+                            st.session_state.auth_manager = AuthManager()
+                        
+                        auth_manager = st.session_state.auth_manager
+                        
+                        # Debug: Check if user exists
+                        if not username or not password:
+                            st.error("❌ Please enter both username and password")
+                        else:
+                            user = auth_manager.authenticate(username.strip(), password)
+                        
+                        if user:
+                            st.session_state.authenticated = True
+                            st.session_state.current_user = user
+                            st.session_state.user_role = user.role
+                            st.session_state.user_id = user.id
+                            st.success("✅ Login successful!")
+                            st.rerun()
+                        else:
+                            # Provide more helpful error message
+                            from database.models import User, create_session
+                            db = create_session()
+                            check_user = db.query(User).filter(User.username == username).first()
+                            db.close()
+                            
+                            if not check_user:
+                                st.error("❌ User not found. Please check your username.")
+                            elif not check_user.is_active:
+                                st.error("❌ Account is inactive. Please contact administrator.")
+                            else:
+                                st.error("❌ Invalid password. Please check your password.")
+                    except Exception as e:
+                        st.error(f"❌ Login error: {str(e)}")
+                        import traceback
+                        with st.expander("Error Details"):
+                            st.code(traceback.format_exc())
             
             with register_tab:
                 st.info("💡 Contact administrator to create an account, or use default admin credentials")
@@ -888,18 +968,21 @@ tabs_list = [
     "⚠️ Risk Monitor", 
     "🔄 Reconciliation", 
     "📋 Trading Rules",
-    "🏛️ Institutional Strategy"
+    "🏛️ Institutional Strategy",
+    "🏛️ Institutional Deployment"  # Always visible
 ]
 
 # Add Backtesting tab if available
 if INTEGRATIONS_AVAILABLE:
     tabs_list.append("🧪 Backtesting")
 
-tab1, tab2, tab3, tab4, tab5, tab6, *rest_tabs = st.tabs(tabs_list)
+tab1, tab2, tab3, tab4, tab5, tab6, tab_deployment, *rest_tabs = st.tabs(tabs_list)
 
 # Backtesting tab (if available)
 if INTEGRATIONS_AVAILABLE and len(rest_tabs) > 0:
     tab_backtest = rest_tabs[0]
+else:
+    tab_backtest = None
 
 with tab1:
     # System Overview Section
@@ -1263,7 +1346,7 @@ with tab1:
                             ]
                         }
                         ref_df = pd.DataFrame(ref_data)
-                        st.dataframe(ref_df, use_container_width=True, hide_index=True)
+                        st.dataframe(ref_df, hide_index=True)
                         
                         # Combined Interpretation
                         st.markdown("<br>", unsafe_allow_html=True)
@@ -1712,7 +1795,7 @@ with tab1:
                                                     ]
                                                 }
                                                 metrics_df = pd.DataFrame(metrics_data)
-                                                st.dataframe(metrics_df, use_container_width=True, hide_index=True)
+                                                st.dataframe(metrics_df, hide_index=True)
                                                     
                                             # Interpretation guide
                                             with st.expander("📚 How to Interpret Market-Adjusted Drawdown", expanded=False):
@@ -4573,7 +4656,7 @@ with tab6:
                                 'Value': [f"{base_add_pct:.0%}", f"{vol_adjustment:.2f}x", f"{corr_adjusted_pct:.2f}x",
                                          f"{weight_adjustment:.2f}x", f"{pnl_adjustment:.2f}x", f"{suggested_add_pct:.1%}"]
                             })
-                            st.dataframe(sizing_details, use_container_width=True, hide_index=True)
+                            st.dataframe(sizing_details, hide_index=True)
                             
                             st.metric("Risk-Adjusted Add Quantity", f"{suggested_qty} shares", 
                                      delta=f"{suggested_add_pct*100:.1f}% of current position")
@@ -4724,7 +4807,7 @@ with tab6:
                             
                             # Display all strategies
                             institutional_df = pd.DataFrame(institutional_stops)
-                            st.dataframe(institutional_df, use_container_width=True, hide_index=True)
+                            st.dataframe(institutional_df, hide_index=True)
                             
                             # Recommended strategy (institutional standard: 2x ATR)
                             recommended_atr_mult = 2.0
@@ -4771,7 +4854,7 @@ with tab6:
                                     })
                                 
                                 progression_df = pd.DataFrame(progressions)
-                                st.dataframe(progression_df, use_container_width=True, hide_index=True)
+                                st.dataframe(progression_df, hide_index=True)
                                 
                                 st.info("💡 **Institutional Rule:** Trailing stop moves up with price but never below break-even after 5% profit. Risk decreases as profit increases.")
                             
@@ -4798,7 +4881,7 @@ with tab6:
                                 })
                             
                             rr_df = pd.DataFrame(risk_reward_ratios)
-                            st.dataframe(rr_df, use_container_width=True, hide_index=True)
+                            st.dataframe(rr_df, hide_index=True)
                             
                             if current_price > avg_price:
                                 current_rr = ((current_price - avg_price) * current_qty) / ((avg_price - recommended_trailing_price) * current_qty) if (avg_price - recommended_trailing_price) > 0 else 0
@@ -4974,7 +5057,7 @@ with tab6:
                                 'Value': [f"{var_based_size:.1%}", f"{vol_based_size:.1%}", f"{corr_adjustment:.2f}x",
                                          f"{base_position_pct:.1%}", f"{currency_symbol}{suggested_capital_amount:,.2f}", f"{suggested_qty} shares"]
                             })
-                            st.dataframe(sizing_breakdown, use_container_width=True, hide_index=True)
+                            st.dataframe(sizing_breakdown, hide_index=True)
                             
                             st.metric("Risk-Adjusted Position Size", f"{suggested_qty} shares",
                                      delta=f"{base_position_pct:.1%} of portfolio ({currency_symbol}{suggested_capital_amount:,.2f})")
@@ -5071,7 +5154,7 @@ with tab6:
                             
                             # Display all strategies
                             institutional_df = pd.DataFrame(institutional_stops)
-                            st.dataframe(institutional_df, use_container_width=True, hide_index=True)
+                            st.dataframe(institutional_df, hide_index=True)
                             
                             # Recommended strategy (institutional standard: 2x ATR)
                             recommended_atr_mult = 2.0
@@ -5117,7 +5200,7 @@ with tab6:
                                 })
                             
                             progression_df = pd.DataFrame(progressions)
-                            st.dataframe(progression_df, use_container_width=True, hide_index=True)
+                            st.dataframe(progression_df, hide_index=True)
                             
                             st.info("💡 **Institutional Rule:** Trailing stop moves up with price maintaining 2x ATR distance. Break-even protection activates after 5% profit.")
                             
@@ -5144,7 +5227,7 @@ with tab6:
                                 })
                             
                             rr_df = pd.DataFrame(risk_reward_ratios)
-                            st.dataframe(rr_df, use_container_width=True, hide_index=True)
+                            st.dataframe(rr_df, hide_index=True)
                             
                             currency_symbol = get_currency_symbol(ticker_input)
                             st.metric("Entry Risk Amount", f"{currency_symbol}{risk_amount:,.2f}",
@@ -5175,7 +5258,7 @@ with tab6:
                                     'Risk Remaining': f"{risk_remaining:.2f}%"
                                 })
                             scenario_df = pd.DataFrame(scenarios)
-                            st.dataframe(scenario_df, use_container_width=True, hide_index=True)
+                            st.dataframe(scenario_df, hide_index=True)
                             st.info("💡 **Institutional Method:** Trailing stop maintains 2x ATR distance. Break-even protection activates after 5% profit.")
                             
                             # Generate trench buy levels
@@ -6119,7 +6202,7 @@ if INTEGRATIONS_AVAILABLE and len(rest_tabs) > 0:
                                             }
                                             for regime, count in sorted(regime_counts.items(), key=lambda x: x[1], reverse=True)
                                         ])
-                                        st.dataframe(regime_df, use_container_width=True, hide_index=True)
+                                        st.dataframe(regime_df, hide_index=True)
                                     
                                     st.markdown("---")
                             except Exception as e:
@@ -6268,7 +6351,7 @@ if INTEGRATIONS_AVAILABLE and len(rest_tabs) > 0:
                                         breakdown_data.append(row)
                                     if breakdown_data:
                                         breakdown_df = pd.DataFrame(breakdown_data)
-                                        st.dataframe(breakdown_df, use_container_width=True, hide_index=True)
+                                        st.dataframe(breakdown_df, hide_index=True)
                                         st.caption("Showing last 10 position sizing decisions using 5-Trench model")
                                         
                                         # Show comparison with standard sizing
@@ -6745,7 +6828,7 @@ if INTEGRATIONS_AVAILABLE and len(rest_tabs) > 0:
                         if result.trades and len(result.trades) > 0:
                             st.markdown("### 📋 Trade History")
                             trades_df = pd.DataFrame(result.trades)
-                            st.dataframe(trades_df, use_container_width=True, hide_index=True)
+                            st.dataframe(trades_df, hide_index=True)
                         
                     except ImportError as e:
                         st.warning(f"⚠️ Backtesting modules not available: {str(e)}")
@@ -6759,6 +6842,966 @@ if INTEGRATIONS_AVAILABLE and len(rest_tabs) > 0:
                 st.error(f"Backtest error: {e}")
                 import traceback
                 st.code(traceback.format_exc())
+
+# Institutional Deployment Tab
+if tab_deployment:
+    with tab_deployment:
+        st.markdown("## 🏛️ Institutional Deployment")
+        st.markdown("---")
+        
+        st.info("💡 **Live Trading**: Execute positions at current market prices using institutional-grade strategies")
+        
+        # Check if integrations are available
+        if not INTEGRATIONS_AVAILABLE:
+            st.warning("⚠️ **Integrations Not Available**: Some features require additional setup. "
+                      "Please ensure all required packages are installed: `pip install -r requirements.txt`")
+            st.stop()
+        
+        # Check Alpaca connection
+        alpaca_connected = False
+        broker_instance = None
+        account_status = None
+        buying_power = 0.0
+        
+        try:
+            if AlpacaBroker:
+                broker_instance = AlpacaBroker()
+                # Test connection by getting account
+                account = broker_instance.api.get_account()
+                alpaca_connected = True
+                account_status = account.status
+                buying_power = float(account.buying_power)
+        except Exception as e:
+            alpaca_connected = False
+            st.warning(f"⚠️ **Alpaca Connection**: {str(e)}")
+            st.info("💡 **Note**: Ensure ALPACA_API_KEY and ALPACA_SECRET_KEY are set in environment variables")
+        
+        if alpaca_connected:
+            st.success(f"✅ **Alpaca Connected** - Account Status: {account_status.upper()} | Buying Power: ${buying_power:,.2f}")
+        
+        col_deploy1, col_deploy2 = st.columns([2, 1])
+        
+        with col_deploy1:
+            st.markdown("### 📊 Deployment Configuration")
+            
+            ticker_deploy = st.text_input(
+                "Ticker Symbol",
+                value="AAPL",
+                help="Symbol to trade",
+                key="deploy_ticker"
+            ).upper()
+            
+            # Portfolio Type Selection
+            portfolio_type_deploy = st.selectbox(
+                "📈 Portfolio Type",
+                ["Scalping", "Intraday", "Swing", "Positional", "Long-Term"],
+                index=2,  # Default to Swing
+                help="Select portfolio type to enforce holding period constraints and risk:reward ratios",
+                key="deploy_portfolio_type"
+            )
+            
+            # Show portfolio type description
+            portfolio_descriptions = {
+                "Scalping": "⚡ Very short-term trades (minutes to hours), high frequency. Max hold: 1 day",
+                "Intraday": "📅 Day trading, same-day entry and exit. Max hold: 1 day",
+                "Swing": "📊 Days to weeks holding period. Hold: 1-14 days",
+                "Positional": "📈 Weeks to months holding period. Hold: 7-90 days",
+                "Long-Term": "🏛️ Months to years holding period. Min hold: 30 days, no max"
+            }
+            st.caption(f"💡 {portfolio_descriptions.get(portfolio_type_deploy, '')}")
+            
+            # Get portfolio type configuration
+            from backtesting.backtest_engine import BacktestEngine
+            portfolio_config = BacktestEngine._get_portfolio_type_config(portfolio_type_deploy)
+            
+            # Display Risk:Reward Ratio
+            risk_reward_min = portfolio_config.get('risk_reward_min', 1.0)
+            risk_reward_max = portfolio_config.get('risk_reward_max', 3.0)
+            risk_reward_default = portfolio_config.get('risk_reward_default', 2.0)
+            
+            risk_reward_ratio_deploy = st.slider(
+                "⚖️ Risk:Reward Ratio",
+                min_value=float(risk_reward_min),
+                max_value=float(risk_reward_max),
+                value=float(risk_reward_default),
+                step=0.1,
+                help=f"Institutional range: {risk_reward_min}:1 to {risk_reward_max}:1",
+                key="deploy_risk_reward"
+            )
+            
+            st.info(f"📊 **Selected Risk:Reward**: **{risk_reward_ratio_deploy:.1f}:1** - "
+                   f"For every $1 risked, target ${risk_reward_ratio_deploy:.1f} profit. "
+                   f"*Institutional range: {risk_reward_min:.1f}:1 - {risk_reward_max:.1f}:1*")
+            
+            # Macro Regime Position Sizing (5-Trench Model)
+            st.markdown("### 🏛️ Macro Regime Position Sizing (5-Trench Model)")
+            use_macro_regime_deploy = st.checkbox(
+                "Enable Macro Regime Position Sizing",
+                value=True,
+                help="Use 5-Trench model: Base × Volatility × Regime × Classification × Persona. "
+                     "Automatically adjusts position sizes based on macro conditions (VIX, yield curves).",
+                key="deploy_use_macro_regime"
+            )
+            
+            if use_macro_regime_deploy:
+                col_macro_deploy1, col_macro_deploy2, col_macro_deploy3 = st.columns(3)
+                
+                with col_macro_deploy1:
+                    macro_base_pct_deploy = st.number_input(
+                        "Base Position %",
+                        min_value=0.01,
+                        max_value=0.10,
+                        value=0.04,
+                        step=0.01,
+                        format="%.2f",
+                        help="Trench 1: Base position percentage (default: 4%)",
+                        key="deploy_macro_base"
+                    )
+                    st.caption("Trench 1: Base")
+                
+                with col_macro_deploy2:
+                    macro_classification_deploy = st.selectbox(
+                        "Classification",
+                        options=["CORE", "SATELLITE"],
+                        index=0,
+                        help="Trench 4: CORE (1.2x) vs SATELLITE (0.8x)",
+                        key="deploy_macro_classification"
+                    )
+                    classification_multiplier_deploy = 1.2 if macro_classification_deploy == "CORE" else 0.8
+                    st.caption(f"Trench 4: {classification_multiplier_deploy}x")
+                
+                with col_macro_deploy3:
+                    macro_persona_deploy = st.slider(
+                        "Persona (Aggression)",
+                        min_value=0.7,
+                        max_value=1.2,
+                        value=1.0,
+                        step=0.1,
+                        help="Trench 5: Aggression level (0.7x conservative to 1.2x aggressive)",
+                        key="deploy_macro_persona"
+                    )
+                    st.caption(f"Trench 5: {macro_persona_deploy}x")
+                
+                macro_max_pct_deploy = st.number_input(
+                    "Maximum Position Cap",
+                    min_value=0.05,
+                    max_value=0.25,
+                    value=0.15,
+                    step=0.01,
+                    format="%.2f",
+                    help="Hard cap on final position size (default: 15%)",
+                    key="deploy_macro_max"
+                )
+                
+                st.info("💡 **5-Trench Model**: Final Size = Base × Volatility × Regime × Classification × Persona. "
+                       "Regime multiplier (0.3x-1.5x) automatically adjusts based on VIX, yield curves, and market conditions.")
+            else:
+                macro_base_pct_deploy = 0.04
+                macro_max_pct_deploy = 0.15
+                classification_multiplier_deploy = 1.0
+                macro_persona_deploy = 1.0
+        
+        with col_deploy2:
+            st.markdown("### ⚙️ Strategy Selection")
+            
+            # Strategy Category - Default to Institutional
+            strategy_category_deploy = st.selectbox(
+                "Strategy Category",
+                [
+                    "📊 Trend Following",
+                    "🚀 Momentum",
+                    "🔄 Mean Reversion",
+                    "📈 Volatility",
+                    "⚖️ Market Neutral",
+                    "💼 Allocation",
+                    "🎯 Regime Adaptive",
+                    "🏛️ Institutional"
+                ],
+                index=7,  # Default to "🏛️ Institutional"
+                key="deploy_category"
+            )
+            
+            # Strategy Type options for Institutional category
+            if strategy_category_deploy == "🏛️ Institutional":
+                strategy_type_options = [
+                    "Inventory-Aware Trench Strategy",
+                    "Macro Regime Position Sizing (5-Trench Model)",
+                    "Institutional Trench Execution",
+                    "Regime-Adaptive Position Sizing"
+                ]
+            else:
+                # Other categories (simplified for now)
+                strategy_type_options = [
+                    "Moving Average Crossover",
+                    "Breakout Strategy",
+                    "Momentum Strategy"
+                ]
+            
+            strategy_type_deploy = st.selectbox(
+                "Strategy Type",
+                strategy_type_options,
+                index=0 if strategy_category_deploy == "🏛️ Institutional" else 0,
+                key="deploy_strategy_type"
+            )
+            
+            # Show strategy description
+            strategy_descriptions = {
+                "Inventory-Aware Trench Strategy": "Institutional-grade inventory-aware trench execution",
+                "Macro Regime Position Sizing (5-Trench Model)": "5-Trench model with macro regime multipliers",
+                "Institutional Trench Execution": "Professional trench deployment strategy",
+                "Regime-Adaptive Position Sizing": "Dynamic sizing based on market regimes"
+            }
+            
+            st.info(f"💡 **Strategy**: {strategy_descriptions.get(strategy_type_deploy, strategy_type_deploy)}")
+            
+            # Current Price Display
+            st.markdown("### 💰 Current Market Price")
+            current_price = None
+            
+            if ticker_deploy:
+                if alpaca_connected and broker_instance:
+                    # Method 1: Try to get price from existing position (most reliable)
+                    try:
+                        positions = broker_instance.api.list_positions()
+                        for pos in positions:
+                            if pos.symbol == ticker_deploy:
+                                current_price = float(pos.current_price)
+                                st.metric("Current Price", f"${current_price:.2f}")
+                                st.caption("From position")
+                                break
+                    except Exception as e:
+                        pass
+                    
+                    # Method 2: Try Alpaca get_bars (if available)
+                    if current_price is None:
+                        try:
+                            if hasattr(broker_instance.api, 'get_bars'):
+                                bars = broker_instance.api.get_bars(
+                                    ticker_deploy,
+                                    "1Min",
+                                    limit=1
+                                )
+                                # Handle both DataFrame and list responses
+                                if hasattr(bars, 'df'):
+                                    bars_df = bars.df
+                                elif isinstance(bars, list) and len(bars) > 0:
+                                    import pandas as pd
+                                    bars_df = pd.DataFrame([{
+                                        'close': bars[0].c,
+                                        'open': bars[0].o,
+                                        'high': bars[0].h,
+                                        'low': bars[0].l,
+                                        'volume': bars[0].v
+                                    }])
+                                else:
+                                    bars_df = None
+                                
+                                if bars_df is not None and not bars_df.empty:
+                                    current_price = float(bars_df['close'].iloc[-1])
+                                    st.metric("Current Price", f"${current_price:.2f}")
+                                    st.caption("Latest 1-minute bar")
+                        except Exception as e:
+                            pass
+                    
+                    # Method 3: Try Alpaca get_latest_trade (if available)
+                    if current_price is None:
+                        try:
+                            if hasattr(broker_instance.api, 'get_latest_trade'):
+                                trade = broker_instance.api.get_latest_trade(ticker_deploy)
+                                if trade:
+                                    current_price = float(trade.p) if hasattr(trade, 'p') else float(trade.price)
+                                    st.metric("Current Price", f"${current_price:.2f}")
+                                    st.caption("Latest trade")
+                        except Exception as e:
+                            pass
+                
+                # Method 4: Fallback to yfinance (always works, but delayed)
+                if current_price is None:
+                    try:
+                        import yfinance as yf
+                        ticker = yf.Ticker(ticker_deploy)
+                        # Try to get latest price from 1-minute data
+                        hist = ticker.history(period='1d', interval='1m')
+                        if not hist.empty:
+                            current_price = float(hist['Close'].iloc[-1])
+                            st.metric("Current Price", f"${current_price:.2f}")
+                            st.caption("⚠️ Using yfinance (delayed data)")
+                        else:
+                            # Fallback to daily data
+                            hist_daily = ticker.history(period='1d', interval='1d')
+                            if not hist_daily.empty:
+                                current_price = float(hist_daily['Close'].iloc[-1])
+                                st.metric("Current Price", f"${current_price:.2f}")
+                                st.caption("⚠️ Using yfinance daily (delayed data)")
+                            else:
+                                # Last resort: use info
+                                info = ticker.info
+                                if 'currentPrice' in info:
+                                    current_price = float(info['currentPrice'])
+                                    st.metric("Current Price", f"${current_price:.2f}")
+                                    st.caption("⚠️ Using yfinance info (delayed data)")
+                    except Exception as e:
+                        st.warning(f"⚠️ Could not fetch price: {str(e)}")
+                        current_price = None
+                
+                # Display bid/ask if available
+                if current_price:
+                    try:
+                        import yfinance as yf
+                        ticker = yf.Ticker(ticker_deploy)
+                        info = ticker.info
+                        if 'bid' in info and 'ask' in info and info.get('bid') and info.get('ask'):
+                            bid = float(info['bid'])
+                            ask = float(info['ask'])
+                            spread = ask - bid
+                            st.caption(f"Bid: ${bid:.2f} | Ask: ${ask:.2f} | Spread: ${spread:.2f}")
+                    except:
+                        pass
+                
+                if current_price is None:
+                    st.warning("⚠️ Price data not available - Please check ticker symbol and connection")
+            else:
+                st.info("💡 Enter ticker symbol to see current price")
+                current_price = None
+            
+            # Store current_price in session state so PREPARE button can access it (always execute)
+            st.session_state['deploy_current_price'] = current_price
+        
+        # Current Positions Display
+        st.markdown("---")
+        st.markdown("### 📊 Current Positions")
+        
+        current_positions = {}
+        if alpaca_connected and broker_instance:
+            try:
+                positions = broker_instance.api.list_positions()
+                if positions:
+                    positions_data = []
+                    for pos in positions:
+                        positions_data.append({
+                            'Symbol': pos.symbol,
+                            'Quantity': int(float(pos.qty)),
+                            'Avg Entry': f"${float(pos.avg_entry_price):.2f}",
+                            'Current Price': f"${float(pos.current_price):.2f}",
+                            'Unrealized P&L': f"${float(pos.unrealized_pl):.2f}",
+                            'Market Value': f"${float(pos.market_value):.2f}"
+                        })
+                        current_positions[pos.symbol] = {
+                            'quantity': int(float(pos.qty)),
+                            'avg_entry': float(pos.avg_entry_price),
+                            'current_price': float(pos.current_price),
+                            'unrealized_pnl': float(pos.unrealized_pl)
+                        }
+                    st.dataframe(pd.DataFrame(positions_data), hide_index=True)
+                else:
+                    st.info("💡 No open positions")
+            except Exception as e:
+                st.warning(f"⚠️ Could not fetch positions: {str(e)}")
+        else:
+            st.info("💡 Connect to Alpaca to see current positions")
+        
+        # Prepare and Execute Workflow
+        st.markdown("---")
+        st.markdown("### 🎯 Prepare & Execute Trade")
+        
+        # Initialize session state for prepared orders
+        if 'prepared_orders' not in st.session_state:
+            st.session_state.prepared_orders = []
+        
+        col_prepare, col_execute = st.columns([1, 1])
+        
+        with col_prepare:
+            # Get current_price from session state (set in price display section above)
+            deploy_current_price = st.session_state.get('deploy_current_price', None)
+            
+            # Enable PREPARE button if we have ticker and price (price can come from yfinance even if Alpaca not connected)
+            prepare_disabled = not ticker_deploy or deploy_current_price is None
+            
+            if st.button("🔍 PREPARE", type="primary", use_container_width=True,
+                        disabled=prepare_disabled):
+                if ticker_deploy and deploy_current_price:
+                    try:
+                        st.info("🔍 Analyzing positions and calculating trench orders...")
+                        
+                        # Get current position for this ticker
+                        current_position_qty = current_positions.get(ticker_deploy, {}).get('quantity', 0)
+                        current_position_avg = current_positions.get(ticker_deploy, {}).get('avg_entry', deploy_current_price)
+                        
+                        # Determine action (BUY or SELL)
+                        action = "BUY"  # Default to BUY
+                        if current_position_qty > 0:
+                            # Check if we should add to position or reduce
+                            # For now, default to BUY (scaling in) or user can manually select SELL
+                            action = "BUY"  # Can be changed to SELL if needed
+                        
+                        proposed_orders = []
+                        
+                        # Calculate trench orders based on strategy type
+                        # For Inventory-Aware Trench Strategy, ALWAYS use macro regime sizing (it's built-in)
+                        force_macro_regime = (strategy_type_deploy == "Inventory-Aware Trench Strategy")
+                        if force_macro_regime or (use_macro_regime_deploy and strategy_type_deploy in ["Macro Regime Position Sizing (5-Trench Model)"]):
+                            # Force macro regime for Inventory-Aware Trench Strategy
+                            if force_macro_regime and not use_macro_regime_deploy:
+                                st.info("💡 **Inventory-Aware Trench Strategy** automatically uses Macro Regime Position Sizing")
+                                # Use default macro regime values if checkbox was unchecked
+                                # Get values from session state if available, otherwise use defaults
+                                macro_base_pct_deploy = st.session_state.get('deploy_macro_base', 0.04)
+                                macro_max_pct_deploy = st.session_state.get('deploy_macro_max', 0.15)
+                                macro_classification_deploy = st.session_state.get('deploy_macro_classification', 'CORE')
+                                classification_multiplier_deploy = 1.2 if macro_classification_deploy == "CORE" else 0.8
+                                macro_persona_deploy = st.session_state.get('deploy_macro_persona', 1.0)
+                                use_macro_regime_deploy = True  # Enable it for the rest of the logic
+                            # Use macro regime position sizing for trench calculation
+                            from backtesting.macro_regime import MacroRegimeDetector, FiveTrenchPositionSizer
+                            from data.realtime_data import get_data_provider
+                            
+                            # Get historical data for macro regime calculation
+                            data_provider = get_data_provider('auto')
+                            end_date = datetime.now()
+                            start_date = end_date - timedelta(days=90)
+                            
+                            try:
+                                hist_data = data_provider.get_historical_data(ticker_deploy, start_date, end_date)
+                                if hist_data is not None and len(hist_data) > 30:
+                                    # Initialize macro regime detector and position sizer
+                                    macro_detector = MacroRegimeDetector(use_real_macro=True)
+                                    position_sizer = FiveTrenchPositionSizer(
+                                        base_pct=macro_base_pct_deploy,
+                                        max_position_pct=macro_max_pct_deploy,
+                                        macro_regime_detector=macro_detector
+                                    )
+                                    
+                                    # Calculate total position size
+                                    portfolio_value = buying_power if alpaca_connected else 100000.0
+                                    total_quantity, breakdown = position_sizer.calculate_position_size(
+                                        portfolio_value=portfolio_value,
+                                        price=deploy_current_price,
+                                        data=hist_data,
+                                        classification_multiplier=classification_multiplier_deploy,
+                                        persona_multiplier=macro_persona_deploy,
+                                        current_date=datetime.now()
+                                    )
+                                    
+                                    total_quantity = int(total_quantity)
+                                    
+                                    # Calculate number of trenches to deploy
+                                    trench_levels = 3  # Default for Inventory-Aware Trench Strategy
+                                    final_pct = breakdown.get('final_pct', macro_max_pct_deploy)
+                                    standard_trench_size = macro_max_pct_deploy / trench_levels  # ~5% per trench
+                                    
+                                    # Determine number of trenches based on final position size
+                                    # If final_pct is 15%, deploy all 3 trenches
+                                    # If final_pct is 10%, deploy 2 trenches  
+                                    # If final_pct is 5%, deploy 1 trench
+                                    num_trenches = max(1, min(trench_levels, int(np.ceil(final_pct / standard_trench_size))))
+                                    
+                                    # Calculate per-trench quantity (distribute total across trenches)
+                                    per_trench_qty = max(1, total_quantity // num_trenches) if num_trenches > 0 else total_quantity
+                                    
+                                    # IMPORTANT: Only prepare Trench 1 initially (incremental deployment)
+                                    # Trenches 2 and 3 will be prepared later as price moves down
+                                    # This matches the Inventory-Aware Trench Strategy behavior
+                                    trench_num = 1  # Only deploy first trench
+                                    # Trench 1 price: execute at current price (market order) or slightly below (limit)
+                                    trench_price = deploy_current_price  # Execute at current price for Trench 1
+                                    
+                                    proposed_orders.append({
+                                        'trench': trench_num,
+                                        'action': action,
+                                        'symbol': ticker_deploy,
+                                        'quantity': per_trench_qty,
+                                        'price': round(trench_price, 2),
+                                        'order_type': 'MARKET',  # Market order for Trench 1 (immediate execution)
+                                        'total_value': per_trench_qty * trench_price,
+                                        'reason': f"Trench 1/{num_trenches}: Macro regime ({breakdown.get('regime_multiplier', 1.0):.2f}x regime, {final_pct*100:.1f}% total). Trenches 2-{num_trenches} will deploy incrementally as price moves."
+                                    })
+                                    
+                                    # Store breakdown for display
+                                    st.session_state.macro_breakdown = breakdown
+                                    
+                                    st.success(f"✅ **Prepared Trench 1 Order using Macro Regime Position Sizing**")
+                                    st.info(f"📊 **Trench 1**: {per_trench_qty} shares ({per_trench_qty * deploy_current_price / portfolio_value * 100:.2f}% of portfolio) | "
+                                           f"**Total Target**: {total_quantity} shares across {num_trenches} trenches ({final_pct*100:.2f}% total) | "
+                                           f"Regime: {breakdown.get('regime_multiplier', 1.0):.2f}x | "
+                                           f"Volatility: {breakdown.get('volatility_multiplier', 1.0):.2f}x")
+                                    st.caption(f"💡 **Incremental Deployment**: Trenches 2-{num_trenches} will be prepared later as price moves down to their levels.")
+                                    
+                                else:
+                                    # Fallback: Standard trench sizing - use max cap
+                                    portfolio_value = buying_power if alpaca_connected else 100000.0
+                                    position_pct = macro_max_pct_deploy if use_macro_regime_deploy else 0.15
+                                    total_quantity = int((portfolio_value * position_pct) / deploy_current_price)
+                                    trench_levels = 3
+                                    per_trench_qty = max(1, total_quantity // trench_levels)
+                                    
+                                    # Only prepare Trench 1 initially (incremental deployment)
+                                    trench_num = 1
+                                    proposed_orders.append({
+                                        'trench': trench_num,
+                                        'action': action,
+                                        'symbol': ticker_deploy,
+                                        'quantity': per_trench_qty,
+                                        'price': deploy_current_price,
+                                        'order_type': 'MARKET',
+                                        'total_value': per_trench_qty * deploy_current_price,
+                                        'reason': f"Trench 1/{trench_levels}: Standard sizing (insufficient data). Trenches 2-{trench_levels} will deploy incrementally."
+                                    })
+                                    
+                                    st.info(f"⚠️ Using standard sizing: Trench 1 only ({per_trench_qty} shares, {position_pct*100:.1f}% total across {trench_levels} trenches)")
+                            except Exception as e:
+                                st.error(f"❌ **Macro regime calculation failed**: {str(e)}")
+                                import traceback
+                                with st.expander("Error Details"):
+                                    st.code(traceback.format_exc())
+                                # Fallback: Use standard trench sizing - only Trench 1 initially
+                                portfolio_value = buying_power if alpaca_connected else 100000.0
+                                position_pct = macro_max_pct_deploy if (use_macro_regime_deploy or force_macro_regime) else 0.15
+                                total_quantity = int((portfolio_value * position_pct) / deploy_current_price)
+                                trench_levels = 3
+                                per_trench_qty = max(1, total_quantity // trench_levels)
+                                
+                                # Only prepare Trench 1 initially (incremental deployment)
+                                trench_num = 1
+                                proposed_orders.append({
+                                    'trench': trench_num,
+                                    'action': action,
+                                    'symbol': ticker_deploy,
+                                    'quantity': per_trench_qty,
+                                    'price': deploy_current_price,
+                                    'order_type': 'MARKET',
+                                    'total_value': per_trench_qty * deploy_current_price,
+                                    'reason': f"Trench 1/{trench_levels}: Fallback sizing ({position_pct*100:.1f}% total - macro regime error). Trenches 2-{trench_levels} will deploy incrementally."
+                                })
+                                
+                                st.warning(f"⚠️ Using fallback sizing: Trench 1 only ({per_trench_qty} shares, {position_pct*100:.1f}% total across {trench_levels} trenches)")
+                        else:
+                            # Standard single order (non-trench strategy)
+                            # Only use this path for non-trench strategies
+                            if strategy_type_deploy == "Inventory-Aware Trench Strategy":
+                                st.error("❌ **Error**: Inventory-Aware Trench Strategy should use macro regime sizing. Please check your configuration.")
+                            portfolio_value = buying_power if alpaca_connected else 100000.0
+                            # Use the configured max cap, not hardcoded 10%
+                            position_pct = macro_max_pct_deploy if use_macro_regime_deploy else 0.15
+                            quantity = int((portfolio_value * position_pct) / deploy_current_price)
+                            proposed_orders.append({
+                                'trench': 1,
+                                'action': action,
+                                'symbol': ticker_deploy,
+                                'quantity': quantity,
+                                'price': deploy_current_price,
+                                'order_type': 'MARKET',
+                                'total_value': quantity * deploy_current_price,
+                                'reason': f'Standard order ({position_pct*100:.1f}% - respects {macro_max_pct_deploy*100:.0f}% cap)'
+                            })
+                        
+                        # Store prepared orders in session state
+                        st.session_state.prepared_orders = proposed_orders
+                        st.session_state.prepared_action = action
+                        st.session_state.prepared_ticker = ticker_deploy
+                        st.rerun()
+                        
+                    except Exception as e:
+                        st.error(f"❌ **Preparation Error**: {str(e)}")
+                        import traceback
+                        with st.expander("Error Details"):
+                            st.code(traceback.format_exc())
+        
+        # Display Prepared Orders
+        if st.session_state.prepared_orders:
+            st.markdown("---")
+            st.markdown("### 📋 Prepared Orders - Review Before Execution")
+            
+            # Show macro regime breakdown if available
+            if 'macro_breakdown' in st.session_state:
+                with st.expander("📊 Macro Regime Breakdown"):
+                    breakdown = st.session_state.macro_breakdown
+                    col_b1, col_b2, col_b3, col_b4 = st.columns(4)
+                    with col_b1:
+                        st.metric("Base %", f"{breakdown.get('base_pct', 0)*100:.2f}%")
+                    with col_b2:
+                        st.metric("Regime", f"{breakdown.get('regime_multiplier', 1.0):.2f}x")
+                    with col_b3:
+                        st.metric("Volatility", f"{breakdown.get('volatility_multiplier', 1.0):.2f}x")
+                    with col_b4:
+                        st.metric("Final %", f"{breakdown.get('final_pct', 0)*100:.2f}%")
+            
+            # Display orders table
+            orders_df_data = []
+            total_value = 0
+            for order in st.session_state.prepared_orders:
+                orders_df_data.append({
+                    'Trench': order['trench'],
+                    'Action': order['action'],
+                    'Symbol': order['symbol'],
+                    'Quantity': order['quantity'],
+                    'Price': f"${order['price']:.2f}",
+                    'Order Type': order['order_type'],
+                    'Total Value': f"${order['total_value']:,.2f}",
+                    'Reason': order['reason']
+                })
+                total_value += order['total_value']
+            
+            orders_df = pd.DataFrame(orders_df_data)
+            st.dataframe(orders_df, hide_index=True)
+            
+            st.info(f"💰 **Total Order Value**: ${total_value:,.2f}")
+            
+            # Execute button
+            with col_execute:
+                execute_disabled = not alpaca_connected or len(st.session_state.prepared_orders) == 0
+                
+                if st.session_state.prepared_action == "BUY":
+                    button_color = "primary"
+                    button_text = "🟢 EXECUTE BUY"
+                else:
+                    button_color = "secondary"
+                    button_text = "🔴 EXECUTE SELL"
+                
+                if st.button(button_text, type=button_color, use_container_width=True, disabled=execute_disabled):
+                    # Execute all prepared orders
+                    executed_count = 0
+                    failed_count = 0
+                    order_ids = []
+                    
+                    for order in st.session_state.prepared_orders:
+                        try:
+                            from oms.oms import OrderManager, Order, OrderType, OrderStatus
+                            
+                            order_type_map = {
+                                'MARKET': OrderType.MARKET,
+                                'LIMIT': OrderType.LIMIT
+                            }
+                            
+                            # Validate order data before creating
+                            if not order.get('symbol') or not order.get('quantity') or order['quantity'] <= 0:
+                                failed_count += 1
+                                st.error(f"❌ Invalid order data for trench {order['trench']}: symbol={order.get('symbol')}, quantity={order.get('quantity')}")
+                                continue
+                            
+                            # Check buying power for BUY orders
+                            if order['action'].upper() == 'BUY' and broker_instance:
+                                try:
+                                    order_value = order['quantity'] * order['price']
+                                    if buying_power and order_value > buying_power:
+                                        failed_count += 1
+                                        st.error(f"❌ Trench {order['trench']}: Insufficient buying power. "
+                                               f"Need ${order_value:,.2f} but only have ${buying_power:,.2f} available.")
+                                        continue
+                                except Exception as e:
+                                    st.warning(f"⚠️ Could not verify buying power: {e}")
+                            
+                            oms_order = Order(
+                                symbol=order['symbol'],
+                                side=order['action'].upper(),  # BUY or SELL (uppercase)
+                                quantity=order['quantity'],
+                                order_type=order_type_map.get(order['order_type'], OrderType.MARKET),
+                                price=order['price'] if order['order_type'] == 'LIMIT' else None,
+                                time_in_force='DAY'
+                            )
+                            
+                            user_id = st.session_state.get('user_id', 1)
+                            
+                            # Ensure broker_instance is available
+                            if not broker_instance:
+                                failed_count += 1
+                                st.error(f"❌ Broker not connected. Please connect to Alpaca first.")
+                                continue
+                            
+                            oms = OrderManager(broker=broker_instance)
+                            submitted_order = oms.create_order(oms_order, user_id)
+                            
+                            # Check order status more carefully
+                            order_status = submitted_order.status.value if hasattr(submitted_order.status, 'value') else str(submitted_order.status)
+                            
+                            # Get rejection reason if available
+                            rejection_reason = None
+                            if hasattr(submitted_order, 'rejection_reason'):
+                                rejection_reason = submitted_order.rejection_reason
+                            
+                            if order_status == "REJECTED":
+                                failed_count += 1
+                                error_msg = f"❌ Trench {order['trench']}: Order rejected by broker"
+                                if rejection_reason:
+                                    error_msg += f" - {rejection_reason}"
+                                st.error(error_msg)
+                                
+                                # Show detailed rejection info
+                                with st.expander(f"🔍 Rejection Details for Trench {order['trench']}"):
+                                    st.markdown(f"""
+                                    **Order Details:**
+                                    - Symbol: {order['symbol']}
+                                    - Quantity: {order['quantity']} shares
+                                    - Order Type: {order['order_type']}
+                                    - Price: ${order['price']:.2f}
+                                    - Status: {order_status}
+                                    """)
+                                    if rejection_reason:
+                                        st.markdown(f"**Rejection Reason:** {rejection_reason}")
+                                    
+                                    st.markdown("""
+                                    **Common Alpaca Rejection Reasons:**
+                                    - **Insufficient Buying Power**: Not enough cash (need ${order['total_value']:.2f})
+                                    - **Invalid Symbol**: Ticker not recognized
+                                    - **Market Closed**: Market orders only work during market hours
+                                    - **Price Too Far**: Limit price too far from market (use market order instead)
+                                    - **Fractional Shares**: Quantity must be whole number
+                                    
+                                    **Quick Fixes:**
+                                    1. Check buying power: Ensure you have at least ${order['total_value']:.2f} available
+                                    2. Use MARKET order instead of LIMIT if market is open
+                                    3. Verify symbol: {order['symbol']} is tradeable
+                                    4. Check market hours: Market orders only work 9:30 AM - 4:00 PM ET
+                                    """)
+                            elif submitted_order.broker_order_id or order_status in ["SUBMITTED", "PENDING", "ACCEPTED", "NEW"]:
+                                executed_count += 1
+                                if submitted_order.broker_order_id:
+                                    order_ids.append(submitted_order.broker_order_id)
+                                
+                                # Log the trade
+                                if 'deployment_trades' not in st.session_state:
+                                    st.session_state.deployment_trades = []
+                                st.session_state.deployment_trades.append({
+                                    'date': datetime.now(),
+                                    'symbol': order['symbol'],
+                                    'action': order['action'],
+                                    'quantity': order['quantity'],
+                                    'price': order['price'],
+                                    'order_id': submitted_order.broker_order_id or 'PENDING',
+                                    'status': order_status,
+                                    'trench': order['trench'],
+                                    'strategy': strategy_type_deploy,
+                                    'macro_regime': use_macro_regime_deploy
+                                })
+                            else:
+                                failed_count += 1
+                                st.error(f"❌ Trench {order['trench']}: Unexpected order status '{order_status}' (expected SUBMITTED)")
+                                st.info(f"Order details: Symbol={order['symbol']}, Qty={order['quantity']}, Type={order['order_type']}, Price=${order['price']:.2f}")
+                        except Exception as e:
+                            failed_count += 1
+                            import traceback
+                            error_msg = str(e)
+                            st.error(f"❌ Failed to execute trench {order.get('trench', '?')}: {error_msg}")
+                            with st.expander(f"Error Details for Trench {order.get('trench', '?')}"):
+                                st.code(traceback.format_exc())
+                    
+                    # Clear prepared orders after execution
+                    st.session_state.prepared_orders = []
+                    if 'macro_breakdown' in st.session_state:
+                        del st.session_state.macro_breakdown
+                    
+                    if executed_count > 0:
+                        st.success(f"✅ **Executed {executed_count} orders successfully!**")
+                        if order_ids:
+                            st.info(f"📋 **Order IDs**: {', '.join(order_ids[:5])}{'...' if len(order_ids) > 5 else ''}")
+                    if failed_count > 0:
+                        st.error(f"❌ **Failed to execute {failed_count} orders**")
+                    
+                    st.rerun()
+                
+                # Clear prepared orders button
+                if st.button("🗑️ Clear Prepared Orders", use_container_width=True):
+                    st.session_state.prepared_orders = []
+                    if 'macro_breakdown' in st.session_state:
+                        del st.session_state.macro_breakdown
+                    st.rerun()
+        
+        # Legacy BUY/SELL buttons (kept for quick actions, but Prepare is recommended)
+        st.markdown("---")
+        st.markdown("### ⚡ Quick Actions (Legacy)")
+        st.caption("💡 **Recommended**: Use PREPARE button above for trench orders with review")
+        
+        col_quick1, col_quick2 = st.columns(2)
+        
+        with col_quick1:
+            if st.button("🟢 QUICK BUY", type="primary", use_container_width=True, 
+                        disabled=not alpaca_connected or not current_price):
+                if ticker_deploy and current_price:
+                    try:
+                        # Calculate position size using macro regime if enabled
+                        if use_macro_regime_deploy and strategy_type_deploy in ["Inventory-Aware Trench Strategy", 
+                                                                                  "Macro Regime Position Sizing (5-Trench Model)"]:
+                            # Use macro regime position sizing
+                            from backtesting.macro_regime import MacroRegimeDetector, FiveTrenchPositionSizer
+                            from data.realtime_data import get_data_provider
+                            
+                            # Get historical data for macro regime calculation
+                            data_provider = get_data_provider('auto')
+                            end_date = datetime.now()
+                            start_date = end_date - timedelta(days=90)
+                            
+                            try:
+                                hist_data = data_provider.get_historical_data(ticker_deploy, start_date, end_date)
+                                if hist_data is not None and len(hist_data) > 30:
+                                    # Initialize macro regime detector and position sizer
+                                    macro_detector = MacroRegimeDetector(use_real_macro=True)
+                                    position_sizer = FiveTrenchPositionSizer(
+                                        base_pct=macro_base_pct_deploy,
+                                        max_position_pct=macro_max_pct_deploy,
+                                        macro_regime_detector=macro_detector
+                                    )
+                                    
+                                    # Calculate position size
+                                    portfolio_value = buying_power if alpaca_connected else 100000.0
+                                    quantity, breakdown = position_sizer.calculate_position_size(
+                                        portfolio_value=portfolio_value,
+                                        price=current_price,
+                                        data=hist_data,
+                                        classification_multiplier=classification_multiplier_deploy,
+                                        persona_multiplier=macro_persona_deploy,
+                                        current_date=datetime.now()
+                                    )
+                                    
+                                    # Get final quantity (shares)
+                                    quantity = int(quantity)
+                                    
+                                    st.success(f"✅ **Macro Regime Calculated**: {quantity} shares "
+                                             f"({breakdown.get('final_pct', 0)*100:.2f}% of portfolio)")
+                                    
+                                    # Show breakdown
+                                    with st.expander("📊 Position Sizing Breakdown"):
+                                        st.json({
+                                            "Base %": f"{breakdown.get('base_pct', 0)*100:.2f}%",
+                                            "Volatility Multiplier": f"{breakdown.get('volatility_multiplier', 1.0):.2f}x",
+                                            "Regime Multiplier": f"{breakdown.get('regime_multiplier', 1.0):.2f}x",
+                                            "Classification Multiplier": f"{breakdown.get('classification_multiplier', 1.0):.2f}x",
+                                            "Persona Multiplier": f"{breakdown.get('persona_multiplier', 1.0):.2f}x",
+                                            "Final %": f"{breakdown.get('final_pct', 0)*100:.2f}%",
+                                            "Quantity": quantity
+                                        })
+                                else:
+                                    # Fallback to standard sizing
+                                    portfolio_value = buying_power if alpaca_connected else 100000.0
+                                    position_pct = macro_max_pct_deploy if use_macro_regime_deploy else 0.10
+                                    quantity = int((portfolio_value * position_pct) / current_price)
+                                    st.info(f"⚠️ Using standard sizing: {quantity} shares ({position_pct*100:.1f}% of portfolio)")
+                            except Exception as e:
+                                st.warning(f"⚠️ Macro regime calculation failed: {str(e)}")
+                                # Fallback to standard sizing
+                                portfolio_value = buying_power if alpaca_connected else 100000.0
+                                position_pct = macro_max_pct_deploy if use_macro_regime_deploy else 0.10
+                                quantity = int((portfolio_value * position_pct) / current_price)
+                        else:
+                            # Standard position sizing
+                            portfolio_value = buying_power if alpaca_connected else 100000.0
+                            position_pct = 0.10  # Default 10%
+                            quantity = int((portfolio_value * position_pct) / current_price)
+                        
+                        if quantity > 0:
+                            # Create order via OMS
+                            from oms.oms import OrderManager, Order, OrderType
+                            
+                            order = Order(
+                                symbol=ticker_deploy,
+                                side='buy',
+                                quantity=quantity,
+                                order_type=OrderType.MARKET,
+                                price=current_price
+                            )
+                            
+                            # Get user ID from session or use default
+                            user_id = st.session_state.get('user_id', 1)
+                            
+                            oms = OrderManager(broker=broker_instance)
+                            submitted_order = oms.create_order(order, user_id)
+                            
+                            if submitted_order.broker_order_id or submitted_order.status.value == "SUBMITTED":
+                                st.success(f"✅ **Order Submitted**: {quantity} shares of {ticker_deploy} @ ${current_price:.2f}")
+                                if submitted_order.broker_order_id:
+                                    st.info(f"📋 **Order ID**: {submitted_order.broker_order_id}")
+                                
+                                # Log the trade
+                                if 'deployment_trades' not in st.session_state:
+                                    st.session_state.deployment_trades = []
+                                st.session_state.deployment_trades.append({
+                                    'date': datetime.now(),
+                                    'symbol': ticker_deploy,
+                                    'action': 'BUY',
+                                    'quantity': quantity,
+                                    'price': current_price,
+                                    'order_id': submitted_order.broker_order_id or 'PENDING',
+                                    'status': submitted_order.status.value,
+                                    'strategy': strategy_type_deploy,
+                                    'macro_regime': use_macro_regime_deploy
+                                })
+                            else:
+                                st.error(f"❌ **Order Failed**: Order status: {submitted_order.status.value}")
+                        else:
+                            st.warning("⚠️ **Invalid Quantity**: Calculated quantity is 0 or negative")
+                    except Exception as e:
+                        st.error(f"❌ **Order Execution Error**: {str(e)}")
+                        import traceback
+                        with st.expander("Error Details"):
+                            st.code(traceback.format_exc())
+                else:
+                    st.warning("⚠️ Please enter a valid ticker and ensure Alpaca is connected")
+        
+        with col_quick2:
+            if st.button("🔴 QUICK SELL", type="secondary", use_container_width=True,
+                        disabled=not alpaca_connected or not current_price):
+                if ticker_deploy and current_price:
+                    try:
+                        # Get current position
+                        positions = broker_instance.api.list_positions()
+                        current_position = None
+                        for pos in positions:
+                            if pos.symbol == ticker_deploy:
+                                current_position = int(float(pos.qty))
+                                break
+                        
+                        if current_position and current_position > 0:
+                            # Create sell order
+                            from oms.oms import OrderManager, Order, OrderType
+                            
+                            order = Order(
+                                symbol=ticker_deploy,
+                                side='sell',
+                                quantity=current_position,
+                                order_type=OrderType.MARKET,
+                                price=current_price
+                            )
+                            
+                            # Get user ID from session or use default
+                            user_id = st.session_state.get('user_id', 1)
+                            
+                            oms = OrderManager(broker=broker_instance)
+                            submitted_order = oms.create_order(order, user_id)
+                            
+                            if submitted_order.broker_order_id or submitted_order.status.value == "SUBMITTED":
+                                st.success(f"✅ **Sell Order Submitted**: {current_position} shares of {ticker_deploy} @ ${current_price:.2f}")
+                                if submitted_order.broker_order_id:
+                                    st.info(f"📋 **Order ID**: {submitted_order.broker_order_id}")
+                                
+                                # Log the trade
+                                if 'deployment_trades' not in st.session_state:
+                                    st.session_state.deployment_trades = []
+                                st.session_state.deployment_trades.append({
+                                    'date': datetime.now(),
+                                    'symbol': ticker_deploy,
+                                    'action': 'SELL',
+                                    'quantity': current_position,
+                                    'price': current_price,
+                                    'order_id': submitted_order.broker_order_id or 'PENDING',
+                                    'status': submitted_order.status.value,
+                                    'strategy': strategy_type_deploy
+                                })
+                            else:
+                                st.error(f"❌ **Order Failed**: Order status: {submitted_order.status.value}")
+                        else:
+                            st.warning(f"⚠️ **No Position**: You don't have a position in {ticker_deploy}")
+                    except Exception as e:
+                        st.error(f"❌ **Order Execution Error**: {str(e)}")
+                        import traceback
+                        with st.expander("Error Details"):
+                            st.code(traceback.format_exc())
+                else:
+                    st.warning("⚠️ Please enter a valid ticker and ensure Alpaca is connected")
+        
+        # Show deployment trade history
+        if 'deployment_trades' in st.session_state and st.session_state.deployment_trades:
+            st.markdown("---")
+            st.markdown("### 📋 Deployment Trade History")
+            trades_df = pd.DataFrame(st.session_state.deployment_trades)
+            st.dataframe(trades_df, hide_index=True)
 
 # Enhanced Footer
 st.markdown("---")

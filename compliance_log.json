@@ -1,0 +1,25 @@
+{"timestamp": "2026-01-27T09:16:32.877801", "event": "KILL_SWITCH", "metrics": {"drawdown": 0.19450619621204068, "max_allowed": 0.12}}
+{"timestamp": "2026-01-27T09:16:33.410954", "event": "KILL_SWITCH", "metrics": {"drawdown": 0.19450619621204068, "max_allowed": 0.12}}
+{"timestamp": "2026-01-27T09:17:15.059317", "event": "KILL_SWITCH", "metrics": {"drawdown": 0.19450619621204068, "max_allowed": 0.12}}
+{"timestamp": "2026-01-27T09:17:15.992952", "event": "KILL_SWITCH", "metrics": {"drawdown": 0.29334500622281773, "max_allowed": 0.12}}
+{"timestamp": "2026-01-27T09:17:16.696168", "event": "KILL_SWITCH", "metrics": {"drawdown": 0.29334500622281773, "max_allowed": 0.12}}
+{"timestamp": "2026-01-27T09:18:21.027910", "event": "KILL_SWITCH", "metrics": {"drawdown": 0.29334500622281773, "max_allowed": 0.12}}
+{"timestamp": "2026-01-27T09:18:35.699872", "event": "KILL_SWITCH", "metrics": {"drawdown": 0.29334500622281773, "max_allowed": 0.12}}
+{"timestamp": "2026-01-27T09:24:29.891753", "event": "KILL_SWITCH", "metrics": {"drawdown": 0.29334500622281773, "max_allowed": 0.12}}
+{"timestamp": "2026-01-27T09:24:35.247522", "event": "KILL_SWITCH", "metrics": {"drawdown": 0.29334500622281773, "max_allowed": 0.12}}
+{"timestamp": "2026-01-27T09:24:36.390320", "event": "KILL_SWITCH", "metrics": {"drawdown": 0.2931937395547372, "max_allowed": 0.12}}
+{"timestamp": "2026-01-27T09:24:37.044839", "event": "KILL_SWITCH", "metrics": {"drawdown": 0.2931937395547372, "max_allowed": 0.12}}
+{"timestamp": "2026-01-27T09:25:00.641865", "event": "KILL_SWITCH", "metrics": {"drawdown": 0.16194396670999794, "max_allowed": 0.12}}
+{"timestamp": "2026-01-27T09:25:01.185741", "event": "KILL_SWITCH", "metrics": {"drawdown": 0.16194396670999794, "max_allowed": 0.12}}
+{"timestamp": "2026-01-27T09:25:30.452301", "event": "KILL_SWITCH", "metrics": {"drawdown": 0.16194396670999794, "max_allowed": 0.12}}
+{"timestamp": "2026-01-27T09:27:39.813545", "event": "RISK_LIMIT_ALERT", "metrics": {"alerts": ["MAX DRAWDOWN BREACHED"], "metrics": {"Max Drawdown": -0.14511811263917937, "VaR": -0.029686969823739816}}}
+{"timestamp": "2026-01-27T09:27:40.416518", "event": "RISK_LIMIT_ALERT", "metrics": {"alerts": ["MAX DRAWDOWN BREACHED"], "metrics": {"Max Drawdown": -0.14511811263917937, "VaR": -0.029686969823739816}}}
+{"timestamp": "2026-01-27T09:28:06.372654", "event": "RISK_LIMIT_ALERT", "metrics": {"alerts": ["MAX DRAWDOWN BREACHED"], "metrics": {"Max Drawdown": -0.14511811263917937, "VaR": -0.029686969823739816}}}
+{"timestamp": "2026-01-27T09:28:54.074851", "event": "RISK_LIMIT_ALERT", "metrics": {"alerts": ["VAR LIMIT BREACHED"], "metrics": {"Max Drawdown": -0.09357145568755908, "VaR": -0.0822300608282993}}}
+{"timestamp": "2026-01-27T09:28:54.583020", "event": "RISK_LIMIT_ALERT", "metrics": {"alerts": ["VAR LIMIT BREACHED"], "metrics": {"Max Drawdown": -0.09357145568755908, "VaR": -0.0822300608282993}}}
+{"timestamp": "2026-01-27T09:29:25.932463", "event": "RISK_LIMIT_ALERT", "metrics": {"alerts": ["VAR LIMIT BREACHED"], "metrics": {"Max Drawdown": -0.09357145568755908, "VaR": -0.0822300608282993}}}
+{"timestamp": "2026-01-27T09:29:30.153815", "event": "RISK_LIMIT_ALERT", "metrics": {"alerts": ["VAR LIMIT BREACHED"], "metrics": {"Max Drawdown": -0.09357145568755908, "VaR": -0.0822300608282993}}}
+{"timestamp": "2026-01-27T09:29:31.219254", "event": "RISK_LIMIT_ALERT", "metrics": {"alerts": ["MAX DRAWDOWN BREACHED", "VAR LIMIT BREACHED"], "metrics": {"Max Drawdown": -0.12185275597728606, "VaR": -0.051912730069965725}}}
+{"timestamp": "2026-01-27T09:29:31.816926", "event": "RISK_LIMIT_ALERT", "metrics": {"alerts": ["MAX DRAWDOWN BREACHED", "VAR LIMIT BREACHED"], "metrics": {"Max Drawdown": -0.12185275597728606, "VaR": -0.051912730069965725}}}
+{"timestamp": "2026-01-27T09:30:00.008811", "event": "RISK_LIMIT_ALERT", "metrics": {"alerts": ["MAX DRAWDOWN BREACHED", "VAR LIMIT BREACHED"], "metrics": {"Max Drawdown": -0.12185275597728606, "VaR": -0.051912730069965725}}}
+{"timestamp": "2026-01-27T09:30:11.771230", "event": "RISK_LIMIT_ALERT", "metrics": {"alerts": ["MAX DRAWDOWN BREACHED", "VAR LIMIT BREACHED"], "metrics": {"Max Drawdown": -0.12185275597728606, "VaR": -0.051912730069965725}}}

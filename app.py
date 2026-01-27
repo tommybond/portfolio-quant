@@ -12,9 +12,29 @@ import matplotlib
 matplotlib.use('Agg')
 
 from core.risk import RiskManager
+from core.risk_enhanced import EnhancedRiskManager
 from core.approval import TradeApproval
 from monitoring.audit import log_event
 from monitoring.reconciliation import reconcile
+from monitoring.alerts import get_alert_manager, AlertLevel
+
+# Phase 1-4 Integrations
+try:
+    from database.models import init_database, create_session, User, Trade, Position, RiskMetric
+    from auth.auth import AuthManager
+    from auth.rbac import check_permission, RBAC
+    from data.realtime_data import get_data_provider
+    from oms.oms import OrderManager, Order, OrderType
+    from oms.broker_alpaca import AlpacaBroker
+    from ems.ems import ExecutionManager, AlgorithmType
+    from ems.algorithms import TWAP, VWAP, ImplementationShortfall
+    from backtesting.backtest_engine import BacktestEngine, BacktestConfig
+    from analytics.attribution import PerformanceAttribution
+    from optimization.portfolio_optimizer import PortfolioOptimizer
+    INTEGRATIONS_AVAILABLE = True
+except ImportError as e:
+    INTEGRATIONS_AVAILABLE = False
+    st.warning(f"⚠️ Some advanced features not available: {e}")
 
 # Page configuration
 st.set_page_config(
@@ -508,6 +528,116 @@ def format_currency(amount, ticker, decimals=2):
     else:
         return f"{symbol}{amount:,.2f}"
 
+def calculate_market_adjusted_drawdown(portfolio_returns, market_returns, 
+                                      window=60, initial_value=100000,
+                                      beta_clip_min=-2.0, beta_clip_max=2.0,
+                                      volatility_floor=0.01):
+    """
+    Calculate market-adjusted (beta-neutral) drawdown using log returns
+    
+    Rules:
+    1. Compute rolling 60-day log-return beta
+    2. Clip beta and apply volatility floor
+    3. Compute excess returns: r_excess = r_portfolio − β × r_market
+    4. Reconstruct excess equity curve
+    5. Compute drawdown on excess equity
+    6. Monitor: Absolute drawdown, Excess drawdown, Rolling beta & correlation
+    
+    Args:
+        portfolio_returns: pd.Series of portfolio returns (simple returns)
+        market_returns: pd.Series of market/benchmark returns (simple returns)
+        window: Rolling window for beta calculation (default: 60 days)
+        initial_value: Initial portfolio value
+        beta_clip_min: Minimum beta value (default: -2.0)
+        beta_clip_max: Maximum beta value (default: 2.0)
+        volatility_floor: Minimum volatility for beta calculation (default: 0.01)
+    
+    Returns:
+        dict with market-adjusted metrics
+    """
+    # Convert to log returns for beta calculation
+    portfolio_log_returns = np.log(1 + portfolio_returns)
+    market_log_returns = np.log(1 + market_returns)
+    
+    # Align data
+    aligned = pd.DataFrame({
+        'portfolio': portfolio_log_returns,
+        'market': market_log_returns
+    }).dropna()
+    
+    if len(aligned) < window:
+        return None
+    
+    # Step 1: Compute rolling 60-day log-return beta
+    rolling_beta = []
+    rolling_correlation = []
+    beta_dates = []
+    
+    for i in range(window, len(aligned)):
+        window_data = aligned.iloc[i-window:i]
+        
+        # Calculate covariance and variance
+        cov = window_data['portfolio'].cov(window_data['market'])
+        market_var = window_data['market'].var()
+        
+        # Step 2: Apply volatility floor
+        if market_var < volatility_floor ** 2:
+            market_var = volatility_floor ** 2
+        
+        # Calculate beta
+        beta = cov / market_var if market_var > 0 else 1.0
+        
+        # Step 2: Clip beta
+        beta = np.clip(beta, beta_clip_min, beta_clip_max)
+        
+        # Calculate correlation
+        corr = window_data['portfolio'].corr(window_data['market'])
+        
+        rolling_beta.append(beta)
+        rolling_correlation.append(corr if not np.isnan(corr) else 0.0)
+        beta_dates.append(aligned.index[i])
+    
+    # Create rolling beta series
+    rolling_beta_series = pd.Series(rolling_beta, index=beta_dates)
+    rolling_corr_series = pd.Series(rolling_correlation, index=beta_dates)
+    
+    # Use average beta for excess return calculation (or use rolling beta)
+    avg_beta = np.mean(rolling_beta) if rolling_beta else 1.0
+    
+    # Step 3: Compute excess returns (using simple returns, not log)
+    # r_excess = r_portfolio − β × r_market
+    excess_returns = portfolio_returns - (avg_beta * market_returns)
+    
+    # Align excess returns with original portfolio returns
+    excess_returns_aligned = excess_returns.reindex(portfolio_returns.index).fillna(0)
+    
+    # Step 4: Reconstruct excess equity curve
+    excess_equity = initial_value * (1 + excess_returns_aligned).cumprod()
+    
+    # Step 5: Compute drawdown on excess equity
+    peak_excess = excess_equity.cummax()
+    excess_drawdown = (peak_excess - excess_equity) / peak_excess
+    
+    # Also compute standard drawdown for comparison
+    portfolio_equity = initial_value * (1 + portfolio_returns).cumprod()
+    peak_standard = portfolio_equity.cummax()
+    standard_drawdown = (peak_standard - portfolio_equity) / peak_standard
+    
+    return {
+        'beta': avg_beta,
+        'rolling_beta': rolling_beta_series,
+        'rolling_correlation': rolling_corr_series,
+        'excess_returns': excess_returns_aligned,
+        'excess_equity': excess_equity,
+        'excess_drawdown': excess_drawdown,
+        'standard_equity': portfolio_equity,
+        'standard_drawdown': standard_drawdown,
+        'max_excess_dd': excess_drawdown.max(),
+        'max_standard_dd': standard_drawdown.max(),
+        'current_excess_dd': excess_drawdown.iloc[-1] if len(excess_drawdown) > 0 else 0,
+        'current_standard_dd': standard_drawdown.iloc[-1] if len(standard_drawdown) > 0 else 0
+    }
+
 def save_config(config):
     with open("config/settings.yaml", "w") as f:
         yaml.dump(config, f)
@@ -515,15 +645,38 @@ def save_config(config):
     if hasattr(load_config, 'clear'):
         load_config.clear()
 
+# Initialize database (if integrations available)
+if INTEGRATIONS_AVAILABLE and "db_initialized" not in st.session_state:
+    try:
+        init_database()
+        st.session_state.db_initialized = True
+    except Exception as e:
+        st.warning(f"Database initialization warning: {e}")
+
+# Initialize authentication
+if INTEGRATIONS_AVAILABLE and "auth_manager" not in st.session_state:
+    st.session_state.auth_manager = AuthManager()
+
 # Initialize session state
 if "risk_manager" not in st.session_state:
     try:
         config = load_config()
-        st.session_state.risk_manager = RiskManager(
-            max_daily_dd=config.get("max_daily_dd", 0.03),
-            max_total_dd=config.get("max_total_dd", 0.12),
-            max_var=config.get("max_var", -0.05)
-        )
+        # Use enhanced risk manager if available
+        if INTEGRATIONS_AVAILABLE:
+            st.session_state.risk_manager = EnhancedRiskManager(
+                max_daily_dd=config.get("max_daily_dd", 0.03),
+                max_total_dd=config.get("max_total_dd", 0.12),
+                max_var=config.get("max_var", -0.05),
+                max_sector_weight=0.25,
+                max_leverage=2.0,
+                min_liquidity_score=0.5
+            )
+        else:
+            st.session_state.risk_manager = RiskManager(
+                max_daily_dd=config.get("max_daily_dd", 0.03),
+                max_total_dd=config.get("max_total_dd", 0.12),
+                max_var=config.get("max_var", -0.05)
+            )
         st.session_state.approval = TradeApproval(
             mode=config.get("approval_mode", "SEMI"),
             enable_compliance=config.get("enable_compliance_logging", True)
@@ -532,9 +685,54 @@ if "risk_manager" not in st.session_state:
         st.session_state.pending_trades = []
         st.session_state.equity_history = []
         st.session_state.equity_data = None
+        
+        # Initialize user session (default to guest mode if not authenticated)
+        if INTEGRATIONS_AVAILABLE:
+            st.session_state.authenticated = False
+            st.session_state.current_user = None
+            st.session_state.user_role = "guest"
     except Exception as e:
         st.error(f"Error initializing system: {str(e)}")
         st.stop()
+
+# Authentication Check (if integrations available)
+if INTEGRATIONS_AVAILABLE and not st.session_state.get("authenticated", False):
+    # Login page
+    st.title("🔐 Login to Nashor Portfolio Quant")
+    
+    col_login1, col_login2, col_login3 = st.columns([1, 2, 1])
+    with col_login2:
+        with st.container():
+            st.markdown("""
+            <div style="background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+            </div>
+            """, unsafe_allow_html=True)
+            
+            login_tab, register_tab = st.tabs(["Login", "Register"])
+            
+            with login_tab:
+                username = st.text_input("Username", key="login_username")
+                password = st.text_input("Password", type="password", key="login_password")
+                
+                if st.button("Login", type="primary", use_container_width=True):
+                    auth_manager = st.session_state.auth_manager
+                    user = auth_manager.authenticate(username, password)
+                    
+                    if user:
+                        st.session_state.authenticated = True
+                        st.session_state.current_user = user
+                        st.session_state.user_role = user.role
+                        st.session_state.user_id = user.id
+                        st.success("✅ Login successful!")
+                        st.rerun()
+                    else:
+                        st.error("❌ Invalid username or password")
+            
+            with register_tab:
+                st.info("💡 Contact administrator to create an account, or use default admin credentials")
+                st.markdown("**Default Admin:** username: `admin`, password: `admin123`")
+    
+    st.stop()
 
 # Sidebar - Enhanced UI
 with st.sidebar:
@@ -545,6 +743,22 @@ with st.sidebar:
         <p style="color: #0369a1; font-size: 0.875rem; margin: 0.5rem 0 0 0; font-weight: 500;">Trading System</p>
     </div>
     """, unsafe_allow_html=True)
+    
+    # User info
+    if INTEGRATIONS_AVAILABLE and st.session_state.get("authenticated"):
+        user = st.session_state.current_user
+        st.markdown(f"""
+        <div style="background: #e0f2fe; padding: 0.75rem; border-radius: 8px; margin-bottom: 1rem;">
+            <p style="color: #075985; margin: 0; font-size: 0.875rem;"><strong>User:</strong> {user.username}</p>
+            <p style="color: #0369a1; margin: 0.25rem 0 0 0; font-size: 0.75rem;">Role: {user.role.title()}</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        if st.button("🚪 Logout", use_container_width=True):
+            st.session_state.authenticated = False
+            st.session_state.current_user = None
+            st.session_state.user_role = "guest"
+            st.rerun()
     
     st.markdown("### ⚙️ System Configuration")
     st.markdown("---")
@@ -668,14 +882,24 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Tabs with enhanced styling - ensure all text is visible
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tabs_list = [
     "📊 Dashboard", 
     "💰 Trade Management", 
     "⚠️ Risk Monitor", 
     "🔄 Reconciliation", 
     "📋 Trading Rules",
     "🏛️ Institutional Strategy"
-])
+]
+
+# Add Backtesting tab if available
+if INTEGRATIONS_AVAILABLE:
+    tabs_list.append("🧪 Backtesting")
+
+tab1, tab2, tab3, tab4, tab5, tab6, *rest_tabs = st.tabs(tabs_list)
+
+# Backtesting tab (if available)
+if INTEGRATIONS_AVAILABLE and len(rest_tabs) > 0:
+    tab_backtest = rest_tabs[0]
 
 with tab1:
     # System Overview Section
@@ -760,9 +984,16 @@ with tab1:
             days = st.slider(
                 "Analysis Period",
                 30, 365, 90,
-                help="Number of days to analyze",
+                help=f"Number of trading days to analyze. For market-adjusted analysis, use 90+ days to ensure 60+ overlapping days.",
                 label_visibility="collapsed"
             )
+            
+            # Show estimated trading days
+            estimated_trading_days = int(days * 0.71)  # ~71% of calendar days are trading days
+            if days < 90:
+                st.caption(f"⚠️ Estimated {estimated_trading_days} trading days. For 60-day rolling beta, use 90+ days.")
+            else:
+                st.caption(f"✅ Estimated {estimated_trading_days} trading days - sufficient for market-adjusted analysis")
             
             # Analysis Period Guidelines
             with st.expander("📚 Analysis Period Guidelines", expanded=False):
@@ -803,8 +1034,27 @@ with tab1:
         
         if analyze_btn:
             try:
-                stock = yf.Ticker(ticker)
-                hist = stock.history(period=f"{days}d")
+                # Use real-time data provider if available, fallback to yfinance
+                # Fetch extra days to account for weekends/holidays (1.5x multiplier)
+                fetch_days_portfolio = max(int(days * 1.5), 90)
+                
+                if INTEGRATIONS_AVAILABLE:
+                    try:
+                        data_provider = get_data_provider('auto')
+                        end_date = datetime.now()
+                        start_date = end_date - timedelta(days=fetch_days_portfolio)
+                        hist = data_provider.get_historical_data(ticker, start_date, end_date, interval='1d')
+                        if hist.empty:
+                            # Fallback to yfinance
+                            stock = yf.Ticker(ticker)
+                            hist = stock.history(period=f"{fetch_days_portfolio}d")
+                    except:
+                        # Fallback to yfinance
+                        stock = yf.Ticker(ticker)
+                        hist = stock.history(period=f"{fetch_days_portfolio}d")
+                else:
+                    stock = yf.Ticker(ticker)
+                    hist = stock.history(period=f"{fetch_days_portfolio}d")
                 
                 if not hist.empty:
                     equity = hist["Close"]
@@ -906,6 +1156,626 @@ with tab1:
                     
                     plt.tight_layout()
                     st.pyplot(fig)
+                    
+                    # Market-Adjusted Drawdown Analysis
+                    st.markdown("---")
+                    st.markdown("### 📊 Market-Adjusted (Beta-Neutral) Drawdown Analysis")
+                    st.markdown("---")
+                    
+                    # Interpretation Rules Section
+                    with st.expander("📖 Interpretation Rules & Guide", expanded=True):
+                        col_guide1, col_guide2 = st.columns(2)
+                        
+                        with col_guide1:
+                            st.markdown("""
+                            <div style="background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%); padding: 1.5rem; border-radius: 8px; border-left: 4px solid #3b82f6;">
+                                <h4 style="color: #075985; margin-top: 0;">📊 Drawdown Comparison</h4>
+                                <p style="color: #0369a1; margin-bottom: 0.5rem;"><strong>Standard Drawdown (Red)</strong></p>
+                                <ul style="color: #0369a1; margin: 0.5rem 0; padding-left: 1.5rem;">
+                                    <li>Total portfolio drawdown</li>
+                                    <li>Includes strategy + market risk</li>
+                                </ul>
+                                <p style="color: #0369a1; margin-bottom: 0.5rem; margin-top: 1rem;"><strong>Market-Adjusted Drawdown (Blue)</strong></p>
+                                <ul style="color: #0369a1; margin: 0.5rem 0; padding-left: 1.5rem;">
+                                    <li>Strategy-specific drawdown</li>
+                                    <li>Removes market component</li>
+                                    <li>Shows only alpha risk</li>
+                                </ul>
+                                <div style="background: white; padding: 1rem; border-radius: 6px; margin-top: 1rem;">
+                                    <p style="color: #075985; margin: 0; font-weight: 600;">✅ Good Signs:</p>
+                                    <ul style="color: #0369a1; margin: 0.5rem 0; padding-left: 1.5rem;">
+                                        <li><strong>Blue < Red</strong>: Strategy outperformed market</li>
+                                        <li><strong>Both Below Limit</strong>: Risk managed</li>
+                                        <li><strong>Blue ≈ 0%</strong>: Low strategy risk</li>
+                                    </ul>
+                                    <p style="color: #dc2626; margin: 0.5rem 0 0 0; font-weight: 600;">⚠️ Warning Signs:</p>
+                                    <ul style="color: #991b1b; margin: 0.5rem 0; padding-left: 1.5rem;">
+                                        <li><strong>Blue > Red</strong>: Strategy underperforming</li>
+                                        <li><strong>Near Max DD</strong>: Risk limit approaching</li>
+                                    </ul>
+                                </div>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        
+                        with col_guide2:
+                            st.markdown("""
+                            <div style="background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%); padding: 1.5rem; border-radius: 8px; border-left: 4px solid #f59e0b;">
+                                <h4 style="color: #92400e; margin-top: 0;">📈 Beta & Correlation</h4>
+                                <p style="color: #78350f; margin-bottom: 0.5rem;"><strong>Beta (Purple Line)</strong></p>
+                                <ul style="color: #78350f; margin: 0.5rem 0; padding-left: 1.5rem;">
+                                    <li><strong>< 0.5</strong>: Defensive, less volatile</li>
+                                    <li><strong>0.5-1.0</strong>: Moderate sensitivity</li>
+                                    <li><strong>> 1.0</strong>: Aggressive, more volatile</li>
+                                </ul>
+                                <p style="color: #78350f; margin-bottom: 0.5rem; margin-top: 1rem;"><strong>Correlation (Orange Line)</strong></p>
+                                <ul style="color: #78350f; margin: 0.5rem 0; padding-left: 1.5rem;">
+                                    <li><strong>< 0.3</strong>: Independent, diversified</li>
+                                    <li><strong>0.3-0.7</strong>: Moderate relationship</li>
+                                    <li><strong>> 0.7</strong>: Market-driven</li>
+                                </ul>
+                                <div style="background: white; padding: 1rem; border-radius: 6px; margin-top: 1rem;">
+                                    <p style="color: #92400e; margin: 0; font-weight: 600;">📊 Trend Interpretation:</p>
+                                    <ul style="color: #78350f; margin: 0.5rem 0; padding-left: 1.5rem;">
+                                        <li><strong>↑ Beta</strong>: More market-sensitive</li>
+                                        <li><strong>↑ Correlation</strong>: Losing diversification</li>
+                                        <li><strong>Stable</strong>: Consistent strategy ✅</li>
+                                    </ul>
+                                </div>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        
+                        st.markdown("<br>", unsafe_allow_html=True)
+                        
+                        # Quick Reference Table
+                        st.markdown("### 🎯 Quick Reference Table")
+                        st.markdown("---")
+                        
+                        ref_data = {
+                            'Signal': [
+                                'Blue < Red',
+                                'Blue > Red',
+                                'Beta < 0.5',
+                                'Beta > 1.2',
+                                'Correlation < 0.3',
+                                'Correlation > 0.7',
+                                'Both Below Max DD',
+                                'Near Max DD Limit'
+                            ],
+                            'Meaning': [
+                                'Strategy outperforming market',
+                                'Strategy underperforming market',
+                                'Defensive positioning',
+                                'Aggressive positioning',
+                                'Well-diversified',
+                                'Market-driven',
+                                'Risk limits respected',
+                                'Risk limit approaching'
+                            ],
+                            'Action': [
+                                '✅ Continue strategy',
+                                '⚠️ Review strategy',
+                                '✅ Good for risk management',
+                                '⚠️ Monitor risk closely',
+                                '✅ Good diversification',
+                                '⚠️ Consider diversification',
+                                '✅ Continue monitoring',
+                                '⚠️ Reduce exposure'
+                            ]
+                        }
+                        ref_df = pd.DataFrame(ref_data)
+                        st.dataframe(ref_df, use_container_width=True, hide_index=True)
+                        
+                        # Combined Interpretation
+                        st.markdown("<br>", unsafe_allow_html=True)
+                        st.markdown("### 🔍 Combined Interpretation Scenarios")
+                        st.markdown("---")
+                        
+                        scenario_col1, scenario_col2 = st.columns(2)
+                        
+                        with scenario_col1:
+                            st.markdown("""
+                            <div style="background: #f0fdf4; padding: 1rem; border-radius: 6px; border-left: 4px solid #10b981;">
+                                <p style="color: #065f46; margin: 0; font-weight: 600;">✅ Healthy Portfolio</p>
+                                <p style="color: #047857; margin: 0.5rem 0; font-size: 0.875rem;">
+                                    <strong>Example:</strong> Blue DD: 3%, Red DD: 8%<br>
+                                    Beta: 0.6, Correlation: 0.5
+                                </p>
+                                <p style="color: #047857; margin: 0; font-size: 0.875rem;">
+                                    Strategy outperforming market with good diversification
+                                </p>
+                            </div>
+                            """, unsafe_allow_html=True)
+                            
+                            st.markdown("<br>", unsafe_allow_html=True)
+                            
+                            st.markdown("""
+                            <div style="background: #fef2f2; padding: 1rem; border-radius: 6px; border-left: 4px solid #ef4444;">
+                                <p style="color: #991b1b; margin: 0; font-weight: 600;">⚠️ Underperforming Strategy</p>
+                                <p style="color: #dc2626; margin: 0.5rem 0; font-size: 0.875rem;">
+                                    <strong>Example:</strong> Blue DD: 8%, Red DD: 6%<br>
+                                    Beta: 0.4, Correlation: 0.3
+                                </p>
+                                <p style="color: #dc2626; margin: 0; font-size: 0.875rem;">
+                                    Strategy adding extra risk beyond market exposure
+                                </p>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        
+                        with scenario_col2:
+                            st.markdown("""
+                            <div style="background: #fef3c7; padding: 1rem; border-radius: 6px; border-left: 4px solid #f59e0b;">
+                                <p style="color: #92400e; margin: 0; font-weight: 600;">ℹ️ Market-Driven Portfolio</p>
+                                <p style="color: #b45309; margin: 0.5rem 0; font-size: 0.875rem;">
+                                    <strong>Example:</strong> Blue DD: 2%, Red DD: 10%<br>
+                                    Beta: 1.1, Correlation: 0.85
+                                </p>
+                                <p style="color: #b45309; margin: 0; font-size: 0.875rem;">
+                                    High market correlation but strategy still outperforming
+                                </p>
+                            </div>
+                            """, unsafe_allow_html=True)
+                            
+                            st.markdown("<br>", unsafe_allow_html=True)
+                            
+                            st.markdown("""
+                            <div style="background: #eff6ff; padding: 1rem; border-radius: 6px; border-left: 4px solid #3b82f6;">
+                                <p style="color: #1e40af; margin: 0; font-weight: 600;">✅ Defensive & Diversified</p>
+                                <p style="color: #2563eb; margin: 0.5rem 0; font-size: 0.875rem;">
+                                    <strong>Example:</strong> Blue DD: 2%, Red DD: 5%<br>
+                                    Beta: 0.4, Correlation: 0.25
+                                </p>
+                                <p style="color: #2563eb; margin: 0; font-size: 0.875rem;">
+                                    Low market exposure with excellent diversification
+                                </p>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        
+                        st.markdown("<br>", unsafe_allow_html=True)
+                        st.info("💡 **Tip**: For detailed interpretation guide, see `MARKET_ADJUSTED_DRAWDOWN_INTERPRETATION.md`")
+                    
+                    # Fetch benchmark data
+                    benchmark = 'SPY'
+                    if ticker.endswith('.NS'):
+                        benchmark = '^NSEI'  # Nifty 50
+                    elif ticker.endswith('.BO') or ticker.endswith('.BS'):
+                        benchmark = '^BSESN'  # BSE Sensex
+                    
+                    try:
+                        # Ensure we fetch enough data to account for weekends/holidays
+                        # Rule of thumb: Need ~1.4x calendar days to get enough trading days
+                        # For 60 trading days, need ~84 calendar days
+                        # Add buffer: fetch 1.5x to ensure sufficient overlap
+                        fetch_days = max(int(days * 1.5), 90)
+                        benchmark_ticker = yf.Ticker(benchmark)
+                        benchmark_hist = benchmark_ticker.history(period=f"{fetch_days}d")
+                        
+                        if not benchmark_hist.empty:
+                            # Align benchmark with portfolio data - use inner join to ensure overlapping dates
+                            benchmark_close = benchmark_hist['Close']
+                            
+                            # Find common dates between equity and benchmark
+                            common_dates = equity.index.intersection(benchmark_close.index)
+                            
+                            # Minimum required: 50 days (for reasonable beta calculation)
+                            # Preferred: 60+ days (for rolling 60-day beta)
+                            min_required = 50
+                            preferred_window = 60
+                            
+                            if len(common_dates) >= min_required:
+                                # Use only common dates
+                                equity_aligned = equity.loc[common_dates]
+                                benchmark_close_aligned = benchmark_close.loc[common_dates]
+                                
+                                # Calculate returns on aligned data
+                                portfolio_returns_aligned = equity_aligned.pct_change().dropna()
+                                benchmark_returns_aligned = benchmark_close_aligned.pct_change().dropna()
+                                
+                                # Further align returns (in case one has NaN on first day)
+                                common_return_dates = portfolio_returns_aligned.index.intersection(benchmark_returns_aligned.index)
+                                
+                                if len(common_return_dates) >= min_required:
+                                    portfolio_returns_final = portfolio_returns_aligned.loc[common_return_dates]
+                                    benchmark_returns_final = benchmark_returns_aligned.loc[common_return_dates]
+                                    
+                                    # Use dynamic window: prefer 60, but use available data if less
+                                    available_days = len(portfolio_returns_final)
+                                    if available_days >= preferred_window:
+                                        beta_window = preferred_window
+                                    else:
+                                        # Use 80% of available data for rolling window, minimum 30
+                                        beta_window = max(30, int(available_days * 0.8))
+                                    
+                                    # Verify we have enough data points
+                                    if len(portfolio_returns_final) >= min_required and len(benchmark_returns_final) >= min_required:
+                                        # Show info if using reduced window
+                                        if available_days < preferred_window:
+                                            st.info(f"ℹ️ Using {available_days} days of data (preferred: {preferred_window}+). Rolling window set to {beta_window} days.")
+                                        
+                                        # Calculate market-adjusted drawdown
+                                        market_adj_result = calculate_market_adjusted_drawdown(
+                                            portfolio_returns_final,
+                                            benchmark_returns_final,
+                                            window=beta_window,
+                                            initial_value=equity_aligned.iloc[0] if len(equity_aligned) > 0 else 100000
+                                        )
+                                        
+                                        if market_adj_result:
+                                            # Display metrics
+                                            st.markdown("#### 📈 Market-Adjusted Metrics")
+                                            col_ma1, col_ma2, col_ma3, col_ma4, col_ma5 = st.columns(5)
+                                            
+                                            with col_ma1:
+                                                st.metric(
+                                                    "Beta",
+                                                    f"{market_adj_result['beta']:.2f}",
+                                                    help=f"Portfolio sensitivity to market ({beta_window}-day average)"
+                                                )
+                                            
+                                            with col_ma2:
+                                                st.metric(
+                                                    "Standard Max DD",
+                                                    f"{market_adj_result['max_standard_dd']:.2%}",
+                                                    delta=f"{market_adj_result['max_standard_dd'] - market_adj_result['max_excess_dd']:.2%}" 
+                                                          if market_adj_result['max_excess_dd'] < market_adj_result['max_standard_dd'] else None,
+                                                    delta_color="normal"
+                                                )
+                                            
+                                            with col_ma3:
+                                                st.metric(
+                                                    "Excess Max DD",
+                                                    f"{market_adj_result['max_excess_dd']:.2%}",
+                                                    help="Strategy-specific drawdown (market-neutral)"
+                                                )
+                                            
+                                            with col_ma4:
+                                                dd_diff = market_adj_result['max_standard_dd'] - market_adj_result['max_excess_dd']
+                                                st.metric(
+                                                    "DD Difference",
+                                                    f"{dd_diff:.2%}",
+                                                    help="Market component of drawdown",
+                                                    delta="Market risk" if dd_diff > 0 else None
+                                                )
+                                            
+                                            with col_ma5:
+                                                current_corr = market_adj_result['rolling_correlation'].iloc[-1] if len(market_adj_result['rolling_correlation']) > 0 else 0
+                                                st.metric(
+                                                    "Correlation",
+                                                    f"{current_corr:.2f}",
+                                                    help="Current portfolio-market correlation"
+                                                )
+                                            
+                                            # Interpretation with detailed analysis
+                                            current_std_dd = market_adj_result['current_standard_dd']
+                                            current_excess_dd = market_adj_result['current_excess_dd']
+                                            max_std_dd = market_adj_result['max_standard_dd']
+                                            max_excess_dd = market_adj_result['max_excess_dd']
+                                            max_dd_limit = st.session_state.config.get("max_total_dd", 0.12)
+                                            
+                                            # Check if drawdowns exceed limit
+                                            exceeds_limit = max_std_dd > max_dd_limit or max_excess_dd > max_dd_limit
+                                            current_exceeds_limit = current_std_dd > max_dd_limit or current_excess_dd > max_dd_limit
+                                            
+                                            # Get current beta and correlation
+                                            current_beta = market_adj_result['rolling_beta'].iloc[-1] if len(market_adj_result['rolling_beta']) > 0 else market_adj_result['beta']
+                                            current_corr = market_adj_result['rolling_correlation'].iloc[-1] if len(market_adj_result['rolling_correlation']) > 0 else 0.0
+                                            
+                                            # Calculate beta trend
+                                            if len(market_adj_result['rolling_beta']) > 10:
+                                                beta_trend = market_adj_result['rolling_beta'].iloc[-1] - market_adj_result['rolling_beta'].iloc[-10]
+                                                beta_trend_text = "increasing" if beta_trend > 0.05 else "decreasing" if beta_trend < -0.05 else "stable"
+                                            else:
+                                                beta_trend_text = "insufficient data"
+                                            
+                                            # Calculate correlation trend
+                                            if len(market_adj_result['rolling_correlation']) > 10:
+                                                corr_trend = market_adj_result['rolling_correlation'].iloc[-1] - market_adj_result['rolling_correlation'].iloc[-10]
+                                                corr_trend_text = "increasing" if corr_trend > 0.05 else "decreasing" if corr_trend < -0.05 else "stable"
+                                            else:
+                                                corr_trend_text = "insufficient data"
+                                            
+                                            # Critical risk assessment
+                                            if exceeds_limit or current_exceeds_limit:
+                                                st.error("🚨 **CRITICAL RISK ALERT** - Drawdown exceeds maximum limit!")
+                                                st.markdown(f"""
+                                                <div style="background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%); padding: 1.5rem; border-radius: 8px; border-left: 4px solid #dc2626; margin: 1rem 0;">
+                                                    <h4 style="color: #991b1b; margin-top: 0;">⚠️ Risk Limit Breached</h4>
+                                                    <p style="color: #991b1b; margin: 0.5rem 0;"><strong>Max Standard DD:</strong> {max_std_dd:.2%} (Limit: {max_dd_limit:.2%})</p>
+                                                    <p style="color: #991b1b; margin: 0.5rem 0;"><strong>Max Excess DD:</strong> {max_excess_dd:.2%}</p>
+                                                    <p style="color: #991b1b; margin: 0.5rem 0;"><strong>Current Standard DD:</strong> {current_std_dd:.2%}</p>
+                                                    <p style="color: #991b1b; margin: 0.5rem 0;"><strong>Current Excess DD:</strong> {current_excess_dd:.2%}</p>
+                                                    <p style="color: #991b1b; margin: 1rem 0 0 0; font-weight: 600;">🚨 IMMEDIATE ACTION REQUIRED:</p>
+                                                    <ul style="color: #991b1b; margin: 0.5rem 0; padding-left: 1.5rem;">
+                                                        <li>Stop trading or reduce exposure immediately</li>
+                                                        <li>Review recent trades and strategy execution</li>
+                                                        <li>Check if kill switch is active</li>
+                                                        <li>Consider reducing position sizes</li>
+                                                    </ul>
+                                                </div>
+                                                """, unsafe_allow_html=True)
+                                            
+                                            # Drawdown comparison interpretation
+                                            if max_excess_dd < max_std_dd:
+                                                st.success("✅ **Strategy outperformed market during drawdown** - Market-adjusted drawdown is lower than standard drawdown")
+                                            elif max_excess_dd > max_std_dd:
+                                                st.warning("⚠️ **Strategy underperformed market during drawdown** - Excess drawdown exceeds standard drawdown")
+                                            else:
+                                                st.info("ℹ️ **Strategy risk is primarily market risk** - High beta exposure")
+                                            
+                                            # Beta and correlation analysis
+                                            st.markdown("---")
+                                            st.markdown("### 🔍 Risk Analysis Summary")
+                                            
+                                            analysis_col1, analysis_col2 = st.columns(2)
+                                            
+                                            with analysis_col1:
+                                                st.markdown(f"""
+                                                <div style="background: #f8fafc; padding: 1rem; border-radius: 6px; border-left: 4px solid #6366f1;">
+                                                    <h5 style="color: #4338ca; margin-top: 0;">📊 Current Metrics</h5>
+                                                    <p style="color: #4f46e5; margin: 0.5rem 0;"><strong>Beta:</strong> {current_beta:.2f}</p>
+                                                    <p style="color: #4f46e5; margin: 0.5rem 0;"><strong>Correlation:</strong> {current_corr:.2f}</p>
+                                                    <p style="color: #4f46e5; margin: 0.5rem 0;"><strong>Beta Trend:</strong> {beta_trend_text}</p>
+                                                    <p style="color: #4f46e5; margin: 0.5rem 0;"><strong>Correlation Trend:</strong> {corr_trend_text}</p>
+                                                </div>
+                                                """, unsafe_allow_html=True)
+                                            
+                                            with analysis_col2:
+                                                # Beta interpretation
+                                                if current_beta < 0.5:
+                                                    beta_status = "✅ Defensive - Less volatile than market"
+                                                    beta_color = "#10b981"
+                                                elif current_beta < 1.0:
+                                                    beta_status = "ℹ️ Moderate - Market-like sensitivity"
+                                                    beta_color = "#3b82f6"
+                                                else:
+                                                    beta_status = "⚠️ Aggressive - More volatile than market"
+                                                    beta_color = "#f59e0b"
+                                                
+                                                # Correlation interpretation
+                                                if current_corr < 0.3:
+                                                    corr_status = "✅ Well-diversified - Independent of market"
+                                                    corr_color = "#10b981"
+                                                elif current_corr < 0.7:
+                                                    corr_status = "ℹ️ Moderate correlation - Some market influence"
+                                                    corr_color = "#3b82f6"
+                                                else:
+                                                    corr_status = "⚠️ High correlation - Market-driven"
+                                                    corr_color = "#f59e0b"
+                                                
+                                                st.markdown(f"""
+                                                <div style="background: #f8fafc; padding: 1rem; border-radius: 6px; border-left: 4px solid #6366f1;">
+                                                    <h5 style="color: #4338ca; margin-top: 0;">🎯 Interpretation</h5>
+                                                    <p style="color: {beta_color}; margin: 0.5rem 0;"><strong>Beta:</strong> {beta_status}</p>
+                                                    <p style="color: {corr_color}; margin: 0.5rem 0;"><strong>Correlation:</strong> {corr_status}</p>
+                                                    <p style="color: #64748b; margin: 0.5rem 0; font-size: 0.875rem;">
+                                                        <strong>Combined:</strong> {"Low risk" if current_beta < 0.5 and current_corr < 0.3 else "Moderate risk" if current_beta < 1.0 and current_corr < 0.7 else "High risk"}
+                                                    </p>
+                                                </div>
+                                                """, unsafe_allow_html=True)
+                                            
+                                            # What this signifies section
+                                            st.markdown("---")
+                                            st.markdown("### 📋 What This Signifies")
+                                            
+                                            # Comprehensive interpretation based on the metrics
+                                            interpretation_points = []
+                                            
+                                            if exceeds_limit:
+                                                interpretation_points.append("🚨 **CRITICAL**: Drawdown exceeded maximum limit - Risk management failure")
+                                            
+                                            if max_excess_dd > max_std_dd:
+                                                interpretation_points.append("⚠️ **Strategy Risk**: Market-adjusted drawdown higher than standard - Strategy underperforming")
+                                            elif max_excess_dd < max_std_dd:
+                                                interpretation_points.append("✅ **Strategy Performance**: Market-adjusted drawdown lower - Strategy outperforming market")
+                                            
+                                            if current_corr > 0.7:
+                                                interpretation_points.append("⚠️ **High Correlation**: Portfolio moving closely with market - Reduced diversification")
+                                            
+                                            if current_beta < 0.5:
+                                                interpretation_points.append("✅ **Low Beta**: Portfolio less volatile than market - Defensive positioning")
+                                            elif current_beta > 1.0:
+                                                interpretation_points.append("⚠️ **High Beta**: Portfolio more volatile than market - Aggressive positioning")
+                                            
+                                            if beta_trend_text == "increasing" and current_corr > 0.7:
+                                                interpretation_points.append("⚠️ **Trend Warning**: Increasing beta + high correlation = Becoming more market-sensitive")
+                                            
+                                            if corr_trend_text == "increasing" and current_corr > 0.6:
+                                                interpretation_points.append("⚠️ **Diversification Loss**: Correlation increasing - Losing independence from market")
+                                            
+                                            if len(interpretation_points) > 0:
+                                                for point in interpretation_points:
+                                                    st.markdown(f"- {point}")
+                                            else:
+                                                st.info("ℹ️ Portfolio metrics within normal ranges")
+                                            
+                                            # Action recommendations
+                                            st.markdown("---")
+                                            st.markdown("### 💡 Recommended Actions")
+                                            
+                                            action_list = []
+                                            
+                                            if exceeds_limit or current_exceeds_limit:
+                                                action_list.append("🚨 **IMMEDIATE**: Stop trading or reduce exposure significantly")
+                                                action_list.append("🚨 **IMMEDIATE**: Verify kill switch is active")
+                                                action_list.append("🚨 **IMMEDIATE**: Review all recent trades")
+                                            
+                                            if max_excess_dd > max_std_dd:
+                                                action_list.append("⚠️ Review strategy execution - Market-adjusted drawdown exceeds standard")
+                                                action_list.append("⚠️ Check for strategy drift or execution errors")
+                                            
+                                            if current_corr > 0.7:
+                                                action_list.append("⚠️ Consider diversifying portfolio - High correlation with market")
+                                                action_list.append("⚠️ Review position concentration")
+                                            
+                                            if beta_trend_text == "increasing" and current_beta > 0.8:
+                                                action_list.append("⚠️ Monitor beta trend - Becoming more market-sensitive")
+                                            
+                                            if corr_trend_text == "increasing":
+                                                action_list.append("⚠️ Monitor correlation trend - Losing diversification")
+                                            
+                                            if current_beta < 0.5 and current_corr < 0.3:
+                                                action_list.append("✅ Portfolio well-diversified - Continue monitoring")
+                                            
+                                            if len(action_list) > 0:
+                                                for action in action_list:
+                                                    st.markdown(f"- {action}")
+                                            else:
+                                                st.success("✅ No immediate actions required - Continue monitoring")
+                                            
+                                            # Charts
+                                            fig_ma, axes_ma = plt.subplots(3, 1, figsize=(12, 12))
+                                            
+                                            # Chart 1: Equity Comparison
+                                            axes_ma[0].plot(market_adj_result['standard_equity'].index, 
+                                                           market_adj_result['standard_equity'].values,
+                                                           label="Standard Equity", color='blue', linewidth=2)
+                                            axes_ma[0].plot(market_adj_result['excess_equity'].index,
+                                                           market_adj_result['excess_equity'].values,
+                                                           label="Market-Adjusted Equity", color='green', linewidth=2)
+                                            axes_ma[0].set_title("Equity Curve Comparison")
+                                            axes_ma[0].set_ylabel("Equity Value")
+                                            axes_ma[0].legend()
+                                            axes_ma[0].grid(True, alpha=0.3)
+                                            
+                                            # Chart 2: Drawdown Comparison
+                                            axes_ma[1].fill_between(market_adj_result['standard_drawdown'].index,
+                                                                   0, market_adj_result['standard_drawdown'].values,
+                                                                   alpha=0.3, color="red", label="Standard Drawdown")
+                                            axes_ma[1].plot(market_adj_result['standard_drawdown'].index,
+                                                           market_adj_result['standard_drawdown'].values,
+                                                           color="red", linewidth=2)
+                                            axes_ma[1].fill_between(market_adj_result['excess_drawdown'].index,
+                                                                   0, market_adj_result['excess_drawdown'].values,
+                                                                   alpha=0.3, color="blue", label="Market-Adjusted Drawdown")
+                                            axes_ma[1].plot(market_adj_result['excess_drawdown'].index,
+                                                           market_adj_result['excess_drawdown'].values,
+                                                           color="blue", linewidth=2)
+                                            axes_ma[1].axhline(y=st.session_state.config.get("max_total_dd", 0.12),
+                                                              color="orange", linestyle="--", label="Max DD Limit")
+                                            axes_ma[1].set_title("Drawdown Comparison")
+                                            axes_ma[1].set_ylabel("Drawdown %")
+                                            axes_ma[1].legend()
+                                            axes_ma[1].grid(True, alpha=0.3)
+                                            
+                                            # Chart 3: Rolling Beta & Correlation
+                                            if len(market_adj_result['rolling_beta']) > 0:
+                                                ax_beta = axes_ma[2]
+                                                ax_corr = ax_beta.twinx()
+                                                
+                                                ax_beta.plot(market_adj_result['rolling_beta'].index,
+                                                            market_adj_result['rolling_beta'].values,
+                                                            label="Rolling Beta (60-day)", color='purple', linewidth=2)
+                                                ax_beta.axhline(y=1.0, color='gray', linestyle='--', alpha=0.5, label="Beta = 1.0")
+                                                ax_beta.set_ylabel("Beta", color='purple')
+                                                ax_beta.tick_params(axis='y', labelcolor='purple')
+                                                ax_beta.legend(loc='upper left')
+                                                ax_beta.grid(True, alpha=0.3)
+                                                
+                                                ax_corr.plot(market_adj_result['rolling_correlation'].index,
+                                                            market_adj_result['rolling_correlation'].values,
+                                                            label="Rolling Correlation", color='orange', linewidth=2)
+                                                ax_corr.set_ylabel("Correlation", color='orange')
+                                                ax_corr.tick_params(axis='y', labelcolor='orange')
+                                                ax_corr.legend(loc='upper right')
+                                                
+                                                axes_ma[2].set_title(f"Rolling Beta & Correlation ({beta_window}-day window)")
+                                                axes_ma[2].set_xlabel("Date")
+                                            
+                                            plt.tight_layout()
+                                            st.pyplot(fig_ma)
+                                            
+                                            # Detailed metrics table
+                                            with st.expander("📊 Detailed Market-Adjusted Metrics", expanded=False):
+                                                metrics_data = {
+                                                    'Metric': [
+                                                        'Average Beta',
+                                                        'Current Beta',
+                                                        'Beta Range',
+                                                        'Average Correlation',
+                                                        'Current Correlation',
+                                                        'Standard Max DD',
+                                                        'Excess Max DD',
+                                                        'DD Difference (Market Component)',
+                                                        'Current Standard DD',
+                                                        'Current Excess DD'
+                                                    ],
+                                                    'Value': [
+                                                        f"{market_adj_result['beta']:.3f}",
+                                                        f"{market_adj_result['rolling_beta'].iloc[-1]:.3f}" if len(market_adj_result['rolling_beta']) > 0 else "N/A",
+                                                        f"{market_adj_result['rolling_beta'].min():.3f} to {market_adj_result['rolling_beta'].max():.3f}" if len(market_adj_result['rolling_beta']) > 0 else "N/A",
+                                                        f"{market_adj_result['rolling_correlation'].mean():.3f}" if len(market_adj_result['rolling_correlation']) > 0 else "N/A",
+                                                        f"{market_adj_result['rolling_correlation'].iloc[-1]:.3f}" if len(market_adj_result['rolling_correlation']) > 0 else "N/A",
+                                                        f"{market_adj_result['max_standard_dd']:.2%}",
+                                                        f"{market_adj_result['max_excess_dd']:.2%}",
+                                                        f"{dd_diff:.2%}",
+                                                        f"{market_adj_result['current_standard_dd']:.2%}",
+                                                        f"{market_adj_result['current_excess_dd']:.2%}"
+                                                    ]
+                                                }
+                                                metrics_df = pd.DataFrame(metrics_data)
+                                                st.dataframe(metrics_df, use_container_width=True, hide_index=True)
+                                                    
+                                            # Interpretation guide
+                                            with st.expander("📚 How to Interpret Market-Adjusted Drawdown", expanded=False):
+                                                st.markdown("""
+                                                ### 📊 **Drawdown Comparison Chart**
+                                                
+                                                **Standard Drawdown (Red)**: Total portfolio drawdown (strategy + market risk)
+                                                
+                                                **Market-Adjusted Drawdown (Blue)**: Strategy-specific drawdown (market-neutral)
+                                                
+                                                **How to Read:**
+                                                - ✅ **Blue < Red**: Strategy outperformed market during drawdown
+                                                - ⚠️ **Blue > Red**: Strategy underperformed market (review needed)
+                                                - ✅ **Both Below Orange Line**: Risk limits respected
+                                                
+                                                ---
+                                                
+                                                ### 📈 **Rolling Beta & Correlation Chart**
+                                                
+                                                **Beta (Purple Line)**:
+                                                - **< 0.5**: Defensive, less volatile than market
+                                                - **0.5-1.0**: Moderate sensitivity
+                                                - **> 1.0**: Aggressive, more volatile than market
+                                                
+                                                **Correlation (Orange Line)**:
+                                                - **< 0.3**: Independent, well-diversified
+                                                - **0.3-0.7**: Moderate market relationship
+                                                - **> 0.7**: Market-driven, less diversification
+                                                
+                                                **Trends to Watch:**
+                                                - **Increasing Beta**: Becoming more market-sensitive
+                                                - **Increasing Correlation**: Losing diversification
+                                                - **Stable Trends**: Consistent strategy execution ✅
+                                                
+                                                ---
+                                                
+                                                ### 🎯 **Quick Interpretation Guide**
+                                                
+                                                | Signal | Meaning | Action |
+                                                |--------|---------|--------|
+                                                | Blue < Red | Strategy outperforming | ✅ Continue |
+                                                | Blue > Red | Strategy underperforming | ⚠️ Review |
+                                                | Beta < 0.5 | Defensive | ✅ Good |
+                                                | Correlation < 0.3 | Diversified | ✅ Good |
+                                                | Below Max DD | Safe | ✅ Continue |
+                                                
+                                                **📖 Full Guide**: See `MARKET_ADJUSTED_DRAWDOWN_INTERPRETATION.md` for detailed interpretation guide.
+                                                """)
+                                        else:
+                                            st.info(f"ℹ️ Market-adjusted calculation returned no result")
+                                    else:
+                                        st.info(f"ℹ️ Insufficient overlapping return data: {len(common_return_dates)} days available (need {min_required}+ days)")
+                                else:
+                                    st.info(f"ℹ️ Insufficient overlapping return data: {len(common_return_dates)} days available (need {min_required}+ days)")
+                            else:
+                                st.info(f"ℹ️ Insufficient overlapping dates: {len(common_dates)} days available (need {min_required}+ days). Portfolio has {len(equity)} days, Benchmark has {len(benchmark_close)} days.")
+                        else:
+                            st.info(f"ℹ️ Benchmark data ({benchmark}) not available or empty")
+                    except Exception as e:
+                        st.warning(f"⚠️ Market-adjusted analysis unavailable: {str(e)}")
+                        if st.session_state.get("debug_mode", False):
+                            import traceback
+                            st.code(traceback.format_exc())
                     
                     # Risk status
                     if risk_status == "KILL":
@@ -1038,54 +1908,104 @@ with tab2:
     st.markdown("**View average price and quantity for your positions**")
     st.markdown("---")
     
-    # Load executed trades from compliance log
+    # Load executed trades from database or compliance log
     positions = {}
-    compliance_log_file = "compliance_log.json"
+    compliance_entries = []
     
-    if os.path.exists(compliance_log_file):
+    # Use database if available, fallback to JSON
+    if INTEGRATIONS_AVAILABLE:
         try:
-            with open(compliance_log_file, 'r') as f:
-                for line in f:
-                    if line.strip():
-                        try:
-                            entry = json.loads(line)
-                            if entry.get('symbol') and entry.get('side') and entry.get('quantity') and entry.get('price'):
-                                symbol = entry['symbol']
-                                side = entry['side']
-                                qty = entry['quantity']
-                                price = entry['price']
-                                timestamp = entry.get('timestamp', '')
-                                
-                                if symbol not in positions:
-                                    positions[symbol] = {
-                                        'buys': [],
-                                        'sells': [],
-                                        'total_bought': 0,
-                                        'total_sold': 0,
-                                        'total_cost': 0.0,
-                                        'total_proceeds': 0.0
-                                    }
-                                
-                                if side.upper() == 'BUY':
-                                    positions[symbol]['buys'].append({
-                                        'qty': qty,
-                                        'price': price,
-                                        'timestamp': timestamp
-                                    })
-                                    positions[symbol]['total_bought'] += qty
-                                    positions[symbol]['total_cost'] += qty * price
-                                elif side.upper() == 'SELL':
-                                    positions[symbol]['sells'].append({
-                                        'qty': qty,
-                                        'price': price,
-                                        'timestamp': timestamp
-                                    })
-                                    positions[symbol]['total_sold'] += qty
-                                    positions[symbol]['total_proceeds'] += qty * price
-                        except json.JSONDecodeError:
-                            continue
+            db = create_session()
+            # Get trades from database
+            user_id = st.session_state.get("user_id")
+            if user_id:
+                trades = db.query(Trade).filter(
+                    Trade.user_id == user_id,
+                    Trade.status == 'FILLED'
+                ).order_by(Trade.created_at.desc()).all()
+            else:
+                trades = db.query(Trade).filter(
+                    Trade.status == 'FILLED'
+                ).order_by(Trade.created_at.desc()).limit(100).all()
+            
+            # Convert to format compatible with existing code
+            for trade in trades:
+                entry = {
+                    'symbol': trade.symbol,
+                    'side': trade.side,
+                    'quantity': trade.quantity,
+                    'price': trade.price,
+                    'timestamp': trade.created_at.isoformat() if trade.created_at else datetime.utcnow().isoformat(),
+                    'status': trade.status
+                }
+                compliance_entries.append(entry)
         except Exception as e:
-            st.warning(f"⚠️ Could not read compliance log: {str(e)}")
+            st.warning(f"Database query failed, using JSON fallback: {e}")
+            # Fallback to JSON
+            compliance_log_file = "compliance_log.json"
+            if os.path.exists(compliance_log_file):
+                try:
+                    with open(compliance_log_file, 'r') as f:
+                        for line in f:
+                            if line.strip():
+                                try:
+                                    entry = json.loads(line)
+                                    compliance_entries.append(entry)
+                                except:
+                                    continue
+                except:
+                    pass
+    else:
+        # Use JSON file
+        compliance_log_file = "compliance_log.json"
+        if os.path.exists(compliance_log_file):
+            try:
+                with open(compliance_log_file, 'r') as f:
+                    for line in f:
+                        if line.strip():
+                            try:
+                                entry = json.loads(line)
+                                compliance_entries.append(entry)
+                            except:
+                                continue
+            except:
+                pass
+    
+    # Process entries into positions
+    for entry in compliance_entries:
+        if entry.get('symbol') and entry.get('side') and entry.get('quantity') and entry.get('price'):
+            symbol = entry['symbol']
+            side = entry['side']
+            qty = entry['quantity']
+            price = entry['price']
+            timestamp = entry.get('timestamp', '')
+            
+            if symbol not in positions:
+                positions[symbol] = {
+                    'buys': [],
+                    'sells': [],
+                    'total_bought': 0,
+                    'total_sold': 0,
+                    'total_cost': 0.0,
+                    'total_proceeds': 0.0
+                }
+            
+            if side.upper() == 'BUY':
+                positions[symbol]['buys'].append({
+                    'qty': qty,
+                    'price': price,
+                    'timestamp': timestamp
+                })
+                positions[symbol]['total_bought'] += qty
+                positions[symbol]['total_cost'] += qty * price
+            elif side.upper() == 'SELL':
+                positions[symbol]['sells'].append({
+                    'qty': qty,
+                    'price': price,
+                    'timestamp': timestamp
+                })
+                positions[symbol]['total_sold'] += qty
+                positions[symbol]['total_proceeds'] += qty * price
     
     # Calculate net positions
     net_positions = {}
@@ -1222,7 +2142,17 @@ with tab2:
                 st.metric("Total Cost", f"{currency_symbol}{pos['total_cost']:,.2f}")
             with col_sum4:
                 try:
-                    current_price = yf.Ticker(selected_symbol).history(period='1d')['Close'].iloc[-1]
+                    # Use real-time data provider if available
+                    if INTEGRATIONS_AVAILABLE:
+                        try:
+                            data_provider = get_data_provider('auto')
+                            current_price = data_provider.get_live_price(selected_symbol)
+                            if current_price is None:
+                                current_price = yf.Ticker(selected_symbol).history(period='1d')['Close'].iloc[-1]
+                        except:
+                            current_price = yf.Ticker(selected_symbol).history(period='1d')['Close'].iloc[-1]
+                    else:
+                        current_price = yf.Ticker(selected_symbol).history(period='1d')['Close'].iloc[-1]
                     current_value = pos['net_quantity'] * current_price
                 except:
                     current_value = pos['net_quantity'] * pos['average_price']
@@ -1318,6 +2248,18 @@ with tab2:
                 label_visibility="collapsed"
             )
             
+            # Execution algorithm selection (if EMS available)
+            execution_algorithm = None
+            if INTEGRATIONS_AVAILABLE:
+                with st.expander("⚙️ Advanced Execution Options", expanded=False):
+                    algo_type = st.selectbox(
+                        "Execution Algorithm",
+                        ["MARKET", "TWAP", "VWAP", "Implementation Shortfall"],
+                        help="Choose execution algorithm for large orders"
+                    )
+                    if algo_type != "MARKET":
+                        execution_algorithm = algo_type
+            
             if st.button("📤 Submit Trade", use_container_width=True, type="primary"):
                 trade = {
                     "symbol": symbol,
@@ -1327,6 +2269,80 @@ with tab2:
                     "timestamp": datetime.now().isoformat()
                 }
                 
+                # Pre-trade risk checks (if enhanced risk manager available)
+                if INTEGRATIONS_AVAILABLE and isinstance(st.session_state.risk_manager, EnhancedRiskManager):
+                    user_id = st.session_state.get("user_id", 1)
+                    portfolio_value = 1000000  # TODO: Get actual portfolio value
+                    total_exposure = portfolio_value * 1.2  # TODO: Calculate actual exposure
+                    
+                    risk_check = st.session_state.risk_manager.comprehensive_pre_trade_check(
+                        symbol=symbol,
+                        side=side,
+                        quantity=int(quantity),
+                        price=float(price),
+                        portfolio_value=portfolio_value,
+                        total_exposure=total_exposure
+                    )
+                    
+                    if not risk_check['allowed']:
+                        st.error("❌ **Trade Rejected - Risk Limits Exceeded**")
+                        for check_name, result in risk_check['checks'].items():
+                            if result.get('violation'):
+                                st.warning(f"⚠️ {check_name}: {result}")
+                        st.stop()
+                
+                # Use OMS if available
+                if INTEGRATIONS_AVAILABLE:
+                    try:
+                        # Initialize broker and OMS
+                        broker = None
+                        try:
+                            broker = AlpacaBroker()
+                        except:
+                            pass  # Use simulation mode
+                        
+                        oms = OrderManager(broker=broker)
+                        
+                        # Create order
+                        order_type_map = {
+                            "MARKET": OrderType.MARKET,
+                            "LIMIT": OrderType.LIMIT,
+                            "STOP": OrderType.STOP
+                        }
+                        order = Order(
+                            symbol=symbol,
+                            side=side,
+                            quantity=int(quantity),
+                            order_type=order_type_map.get("MARKET", OrderType.MARKET),
+                            price=float(price) if price > 0 else None
+                        )
+                        
+                        user_id = st.session_state.get("user_id", 1)
+                        submitted_order = oms.create_order(order, user_id)
+                        
+                        if submitted_order.status == OrderStatus.SUBMITTED:
+                            st.success(f"✅ Trade submitted via OMS (Order ID: {submitted_order.broker_order_id or 'Local'})")
+                            
+                            # Send alert
+                            if INTEGRATIONS_AVAILABLE:
+                                alert_mgr = get_alert_manager()
+                                alert_mgr.send_trade_alert({
+                                    'symbol': symbol,
+                                    'side': side,
+                                    'quantity': int(quantity),
+                                    'price': float(price)
+                                })
+                        else:
+                            st.error(f"❌ Trade submission failed: {submitted_order.status.value}")
+                        
+                        log_event("TRADE_EXECUTED", trade)
+                        st.rerun()
+                        
+                    except Exception as e:
+                        st.warning(f"OMS submission failed, using legacy method: {e}")
+                        # Fall through to legacy approval workflow
+                
+                # Legacy approval workflow (fallback)
                 if st.session_state.config.get("approval_mode") == "AUTO":
                     approved = st.session_state.approval.approve(trade)
                     if approved:
@@ -1357,6 +2373,35 @@ with tab2:
                     with col_approve:
                         if st.button("✅ Approve", key=f"approve_{i}", use_container_width=True):
                             trade["approved"] = True
+                            
+                            # Use OMS if available
+                            if INTEGRATIONS_AVAILABLE:
+                                try:
+                                    broker = None
+                                    try:
+                                        broker = AlpacaBroker()
+                                    except:
+                                        pass
+                                    
+                                    oms = OrderManager(broker=broker)
+                                    order = Order(
+                                        symbol=trade['symbol'],
+                                        side=trade['side'],
+                                        quantity=trade['quantity'],
+                                        order_type=OrderType.MARKET,
+                                        price=trade['price']
+                                    )
+                                    
+                                    user_id = st.session_state.get("user_id", 1)
+                                    submitted_order = oms.create_order(order, user_id)
+                                    
+                                    if submitted_order.status == OrderStatus.SUBMITTED:
+                                        st.success(f"✅ Order submitted (ID: {submitted_order.broker_order_id or 'Local'})")
+                                    else:
+                                        st.warning(f"⚠️ Order status: {submitted_order.status.value}")
+                                except Exception as e:
+                                    st.warning(f"OMS submission failed: {e}")
+                            
                             log_event("TRADE_EXECUTED", trade)
                             # Log to compliance system
                             from monitoring.compliance import ComplianceLogger
@@ -1522,13 +2567,96 @@ with tab3:
         col1, col2, col3 = st.columns(3)
         
         with col1:
-            st.metric("Current Equity", f"${equity_series.iloc[-1]:.2f}")
+            equity_ticker = st.session_state.equity_data.get('ticker', 'USD') if hasattr(st.session_state, 'equity_data') else 'USD'
+            currency_symbol = get_currency_symbol(equity_ticker)
+            st.metric("Current Equity", f"{currency_symbol}{equity_series.iloc[-1]:,.2f}")
         
         with col2:
-            st.metric("Peak Equity", f"${peak.iloc[-1]:.2f}")
+            st.metric("Peak Equity", f"{currency_symbol}{peak.iloc[-1]:,.2f}")
         
         with col3:
             st.metric("Current Drawdown", f"{drawdown.iloc[-1]:.2%}")
+        
+        # Market-Adjusted Drawdown (if equity data available)
+        if hasattr(st.session_state, 'equity_data') and st.session_state.equity_data:
+            equity_data = st.session_state.equity_data
+            if 'returns' in equity_data and len(equity_data['returns']) > 60:
+                try:
+                    # Get benchmark
+                    ticker = equity_data.get('ticker', 'AAPL')
+                    benchmark = 'SPY'
+                    if ticker.endswith('.NS'):
+                        benchmark = '^NSEI'
+                    elif ticker.endswith('.BO') or ticker.endswith('.BS'):
+                        benchmark = '^BSESN'
+                    
+                    benchmark_ticker = yf.Ticker(benchmark)
+                    benchmark_hist = benchmark_ticker.history(period="1y")
+                    
+                    if not benchmark_hist.empty:
+                        benchmark_returns = benchmark_hist['Close'].pct_change().dropna()
+                        portfolio_returns = equity_data['returns']
+                        
+                        # Align data
+                        aligned_returns = portfolio_returns.reindex(benchmark_returns.index).dropna()
+                        aligned_benchmark = benchmark_returns.reindex(aligned_returns.index).dropna()
+                        
+                        if len(aligned_returns) > 60 and len(aligned_benchmark) > 60:
+                            market_adj_result = calculate_market_adjusted_drawdown(
+                                aligned_returns,
+                                aligned_benchmark,
+                                window=60,
+                                initial_value=equity_series.iloc[0] if len(equity_series) > 0 else 100000
+                            )
+                            
+                            if market_adj_result:
+                                st.markdown("<br>", unsafe_allow_html=True)
+                                st.markdown("### 📊 Market-Adjusted Drawdown Metrics")
+                                st.markdown("---")
+                                
+                                col_ma1, col_ma2, col_ma3, col_ma4 = st.columns(4)
+                                
+                                with col_ma1:
+                                    st.metric("Beta", f"{market_adj_result['beta']:.2f}")
+                                
+                                with col_ma2:
+                                    st.metric("Standard Max DD", f"{market_adj_result['max_standard_dd']:.2%}")
+                                
+                                with col_ma3:
+                                    st.metric("Excess Max DD", f"{market_adj_result['max_excess_dd']:.2%}")
+                                
+                                with col_ma4:
+                                    dd_diff = market_adj_result['max_standard_dd'] - market_adj_result['max_excess_dd']
+                                    st.metric("Market Component", f"{dd_diff:.2%}")
+                                
+                                # Rolling beta and correlation chart
+                                if len(market_adj_result['rolling_beta']) > 0:
+                                    fig_monitor, ax_monitor = plt.subplots(figsize=(12, 4))
+                                    ax_corr_monitor = ax_monitor.twinx()
+                                    
+                                    ax_monitor.plot(market_adj_result['rolling_beta'].index,
+                                                   market_adj_result['rolling_beta'].values,
+                                                   label="Rolling Beta", color='purple', linewidth=2)
+                                    ax_monitor.axhline(y=1.0, color='gray', linestyle='--', alpha=0.5)
+                                    ax_monitor.set_ylabel("Beta", color='purple')
+                                    ax_monitor.tick_params(axis='y', labelcolor='purple')
+                                    ax_monitor.legend(loc='upper left')
+                                    ax_monitor.grid(True, alpha=0.3)
+                                    
+                                    ax_corr_monitor.plot(market_adj_result['rolling_correlation'].index,
+                                                        market_adj_result['rolling_correlation'].values,
+                                                        label="Correlation", color='orange', linewidth=2)
+                                    ax_corr_monitor.set_ylabel("Correlation", color='orange')
+                                    ax_corr_monitor.tick_params(axis='y', labelcolor='orange')
+                                    ax_corr_monitor.legend(loc='upper right')
+                                    
+                                    ax_monitor.set_title("Rolling Beta & Correlation Monitoring (60-day window)")
+                                    ax_monitor.set_xlabel("Date")
+                                    
+                                    plt.tight_layout()
+                                    st.pyplot(fig_monitor)
+                except Exception as e:
+                    pass  # Silently fail if market-adjusted analysis unavailable
         
         # Institutional features: VaR/CVaR and Stress Testing
         if config.get("enable_compliance_logging", True):
@@ -1672,9 +2800,34 @@ with tab5:
         analyze_button = st.button("🔍 Analyze Trading Rules", key="analyze_rules", use_container_width=True, type="primary")
     
     if analyze_button:
+        # Initialize score variables before any try blocks
+        rule1_score = 0
+        rule2_score = 0
+        rule3_score = 0
+        
         try:
-            stock = yf.Ticker(ticker_input)
-            hist = stock.history(period="1y")
+            # Initialize stock variable
+            stock = None
+            
+            # Use real-time data provider if available
+            if INTEGRATIONS_AVAILABLE:
+                try:
+                    data_provider = get_data_provider('auto')
+                    end_date = datetime.now()
+                    start_date = end_date - timedelta(days=365)
+                    hist = data_provider.get_historical_data(ticker_input, start_date, end_date, interval='1d')
+                    if hist.empty:
+                        stock = yf.Ticker(ticker_input)
+                        hist = stock.history(period="1y")
+                    else:
+                        # Still create stock object for info access
+                        stock = yf.Ticker(ticker_input)
+                except:
+                    stock = yf.Ticker(ticker_input)
+                    hist = stock.history(period="1y")
+            else:
+                stock = yf.Ticker(ticker_input)
+                hist = stock.history(period="1y")
             
             if hist.empty:
                 st.error("No data available for this ticker")
@@ -1708,6 +2861,10 @@ with tab5:
                 st.markdown("---")
                 
                 try:
+                    # Ensure stock is defined
+                    if stock is None:
+                        stock = yf.Ticker(ticker_input)
+                    
                     info = stock.info
                     financials = None
                     quarterly_financials = None
@@ -1965,6 +3122,7 @@ with tab5:
                 except Exception as e:
                     st.warning(f"Fundamental data not fully available: {str(e)}")
                     st.info("Some fundamental metrics may not be available for this ticker")
+                    # rule1_score already initialized to 0 above, so it's safe to use
                 
                 st.divider()
                 
@@ -2912,6 +4070,14 @@ with tab5:
                 # ========== OVERALL ASSESSMENT ==========
                 st.markdown("## 🎯 Overall Trading Rules Assessment")
                 st.markdown("---")
+                
+                # Ensure all scores are defined (they should be initialized at the start)
+                if 'rule1_score' not in locals():
+                    rule1_score = 0
+                if 'rule2_score' not in locals():
+                    rule2_score = 0
+                if 'rule3_score' not in locals():
+                    rule3_score = 0
                 
                 total_score = rule1_score + rule2_score + rule3_score
                 max_score = 13  # 5 + 4 + 4 (Rule 1 now has 5 criteria)
@@ -4349,15 +5515,1281 @@ with tab6:
     else:
         st.info("ℹ️ Analyze equity in Dashboard tab to see risk metrics here")
 
+# Backtesting Tab (if integrations available)
+if INTEGRATIONS_AVAILABLE and len(rest_tabs) > 0:
+    with tab_backtest:
+        st.markdown("## 🧪 Strategy Backtesting")
+        st.markdown("---")
+        
+        st.info("💡 **Backtesting Engine**: Test your trading strategies on historical data before live trading")
+        
+        col_bt1, col_bt2 = st.columns([2, 1])
+        
+        with col_bt1:
+            st.markdown("### 📊 Backtest Configuration")
+            
+            ticker_backtest = st.text_input(
+                "Ticker Symbol",
+                value="AAPL",
+                help="Symbol to backtest",
+                key="backtest_ticker"
+            )
+            
+            # Portfolio Type Selection
+            portfolio_type_bt = st.selectbox(
+                "📈 Portfolio Type",
+                ["Scalping", "Intraday", "Swing", "Positional", "Long-Term"],
+                index=2,  # Default to Swing
+                help="Select portfolio type to enforce holding period constraints and risk:reward ratios",
+                key="backtest_portfolio_type"
+            )
+            
+            # Get portfolio type configuration
+            from backtesting.backtest_engine import BacktestEngine
+            portfolio_config = BacktestEngine._get_portfolio_type_config(portfolio_type_bt)
+            
+            # Show portfolio type description with risk:reward info
+            portfolio_descriptions = {
+                "Scalping": "⚡ Very short-term trades (minutes to hours), high frequency. Max hold: 1 day",
+                "Intraday": "📅 Day trading, same-day entry and exit. Max hold: 1 day",
+                "Swing": "📊 Days to weeks holding period. Hold: 1-14 days",
+                "Positional": "📈 Weeks to months holding period. Hold: 7-90 days",
+                "Long-Term": "🏛️ Months to years holding period. Min hold: 30 days, no max"
+            }
+            st.caption(f"💡 {portfolio_descriptions.get(portfolio_type_bt, '')}")
+            
+            # Display Risk:Reward Ratio
+            risk_reward_min = portfolio_config.get('risk_reward_min', 1.0)
+            risk_reward_max = portfolio_config.get('risk_reward_max', 3.0)
+            risk_reward_default = portfolio_config.get('risk_reward_default', 2.0)
+            
+            risk_reward_ratio_bt = st.slider(
+                "⚖️ Risk:Reward Ratio",
+                min_value=float(risk_reward_min),
+                max_value=float(risk_reward_max),
+                value=float(risk_reward_default),
+                step=0.1,
+                help=f"Institutional range: {risk_reward_min}:1 to {risk_reward_max}:1. "
+                     f"Example: {risk_reward_default}:1 means risk $1 to make ${risk_reward_default}",
+                key="backtest_risk_reward"
+            )
+            
+            # Show risk:reward interpretation
+            st.info(f"📊 **Selected Risk:Reward**: **{risk_reward_ratio_bt:.1f}:1** - "
+                   f"For every $1 risked, target ${risk_reward_ratio_bt:.1f} profit. "
+                   f"*Institutional range: {risk_reward_min:.1f}:1 - {risk_reward_max:.1f}:1*")
+            
+            # Macro Regime Position Sizing (5-Trench Model)
+            st.markdown("### 🏛️ Macro Regime Position Sizing (5-Trench Model)")
+            use_macro_regime_bt = st.checkbox(
+                "Enable Macro Regime Position Sizing",
+                value=False,
+                help="Use 5-Trench model: Base × Volatility × Regime × Classification × Persona. "
+                     "Automatically adjusts position sizes based on macro conditions (VIX, yield curves).",
+                key="backtest_use_macro_regime"
+            )
+            
+            # Comparison mode: Run both with/without macro regime
+            compare_macro_regime = False
+            if use_macro_regime_bt:
+                compare_macro_regime = st.checkbox(
+                    "📊 Compare with Standard Sizing",
+                    value=False,
+                    help="Run both backtests (with/without macro regime) and show comparison. "
+                         "This will display macro regime values in parentheses for each metric.",
+                    key="backtest_compare_macro"
+                )
+            
+            if use_macro_regime_bt:
+                col_macro1, col_macro2, col_macro3 = st.columns(3)
+                
+                with col_macro1:
+                    macro_base_pct_bt = st.number_input(
+                        "Base Position %",
+                        min_value=0.01,
+                        max_value=0.10,
+                        value=0.04,
+                        step=0.01,
+                        format="%.2f",
+                        help="Trench 1: Base position percentage (default: 4%)",
+                        key="backtest_macro_base"
+                    )
+                    st.caption("Trench 1: Base")
+                
+                with col_macro2:
+                    macro_classification_bt = st.selectbox(
+                        "Classification",
+                        options=["CORE", "SATELLITE"],
+                        index=0,
+                        help="Trench 4: CORE (1.2x) vs SATELLITE (0.8x)",
+                        key="backtest_macro_classification"
+                    )
+                    classification_multiplier = 1.2 if macro_classification_bt == "CORE" else 0.8
+                    st.caption(f"Trench 4: {classification_multiplier}x")
+                
+                with col_macro3:
+                    macro_persona_bt = st.slider(
+                        "Persona (Aggression)",
+                        min_value=0.7,
+                        max_value=1.2,
+                        value=1.0,
+                        step=0.1,
+                        help="Trench 5: Aggression level (0.7x conservative to 1.2x aggressive)",
+                        key="backtest_macro_persona"
+                    )
+                    st.caption(f"Trench 5: {macro_persona_bt}x")
+                
+                macro_max_pct_bt = st.number_input(
+                    "Maximum Position Cap",
+                    min_value=0.05,
+                    max_value=0.25,
+                    value=0.15,
+                    step=0.01,
+                    format="%.2f",
+                    help="Hard cap on final position size (default: 15%)",
+                    key="backtest_macro_max"
+                )
+                
+                st.info("💡 **5-Trench Model**: Final Size = Base × Volatility × Regime × Classification × Persona. "
+                       "Regime multiplier (0.3x-1.5x) automatically adjusts based on VIX, yield curves, and market conditions.")
+            else:
+                macro_base_pct_bt = 0.04
+                macro_max_pct_bt = 0.15
+                classification_multiplier = 1.0
+                macro_persona_bt = 1.0
+                compare_macro_regime = False
+            
+            col_bt_date1, col_bt_date2 = st.columns(2)
+            with col_bt_date1:
+                start_date_bt = st.date_input(
+                    "Start Date",
+                    value=datetime.now() - timedelta(days=365),
+                    key="backtest_start"
+                )
+            with col_bt_date2:
+                end_date_bt = st.date_input(
+                    "End Date",
+                    value=datetime.now(),
+                    key="backtest_end"
+                )
+            
+            col_bt_config1, col_bt_config2, col_bt_config3 = st.columns(3)
+            with col_bt_config1:
+                initial_capital_bt = st.number_input(
+                    "Initial Capital",
+                    min_value=1000.0,
+                    value=100000.0,
+                    step=10000.0,
+                    format="%.2f",
+                    key="backtest_capital"
+                )
+            with col_bt_config2:
+                # Adjust commission based on portfolio type
+                commission_base = 0.1
+                commission_multipliers = {
+                    "Scalping": 1.5,
+                    "Intraday": 1.2,
+                    "Swing": 1.0,
+                    "Positional": 0.8,
+                    "Long term": 0.5
+                }
+                commission_bt = st.number_input(
+                    "Commission (%)",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=commission_base * commission_multipliers.get(portfolio_type_bt, 1.0),
+                    step=0.01,
+                    format="%.3f",
+                    help=f"Adjusted for {portfolio_type_bt} portfolio type",
+                    key="backtest_commission"
+                )
+            with col_bt_config3:
+                # Adjust slippage based on portfolio type
+                slippage_base = 0.05
+                slippage_multipliers = {
+                    "Scalping": 2.0,
+                    "Intraday": 1.5,
+                    "Swing": 1.0,
+                    "Positional": 0.8,
+                    "Long term": 0.5
+                }
+                slippage_bt = st.number_input(
+                    "Slippage (%)",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=slippage_base * slippage_multipliers.get(portfolio_type_bt, 1.0),
+                    step=0.01,
+                    format="%.3f",
+                    help=f"Adjusted for {portfolio_type_bt} portfolio type",
+                    key="backtest_slippage"
+                )
+        
+        with col_bt2:
+            st.markdown("### ⚙️ Strategy Selection")
+            
+            # Strategy categories
+            strategy_category = st.selectbox(
+                "Strategy Category",
+                [
+                    "📊 Trend Following",
+                    "🚀 Momentum",
+                    "🔄 Mean Reversion",
+                    "📈 Volatility",
+                    "⚖️ Market Neutral",
+                    "💼 Allocation",
+                    "🎯 Regime Adaptive",
+                    "🏛️ Institutional"
+                ],
+                index=7,  # Default to "🏛️ Institutional"
+                key="backtest_category"
+            )
+            
+            # Strategy options based on category
+            strategy_options = {
+                "📊 Trend Following": [
+                    "Moving Average Crossover",
+                    "Breakout",
+                    "Time-Series Momentum"
+                ],
+                "🚀 Momentum": [
+                    "Momentum",
+                    "Cross-Sectional Momentum",
+                    "Volatility-Adjusted Momentum"
+                ],
+                "🔄 Mean Reversion": [
+                    "Mean Reversion (Bollinger)",
+                    "Statistical Mean Reversion",
+                    "VWAP Reversion"
+                ],
+                "📈 Volatility": [
+                    "Volatility Breakout",
+                    "Trench Deployment"
+                ],
+                "⚖️ Market Neutral": [
+                    "Pairs Trading",
+                    "Beta-Neutral L/S"
+                ],
+                "💼 Allocation": [
+                    "Risk Parity",
+                    "Mean-Variance"
+                ],
+                "🎯 Regime Adaptive": [
+                    "Auto Strategy Selector"
+                ],
+                "🏛️ Institutional": [
+                    "Inventory-Aware Trench Strategy"
+                ]
+            }
+            
+            # Get strategy options for selected category
+            available_strategies = strategy_options.get(strategy_category, ["Momentum"])
+            
+            # Set default index based on category
+            default_index = 0
+            if strategy_category == "🏛️ Institutional":
+                # Default to "Inventory-Aware Trench Strategy"
+                if "Inventory-Aware Trench Strategy" in available_strategies:
+                    default_index = available_strategies.index("Inventory-Aware Trench Strategy")
+            
+            strategy_type = st.selectbox(
+                "Strategy Type",
+                available_strategies,
+                index=default_index,
+                key="backtest_strategy"
+            )
+            
+            # Initialize strategy parameters
+            short_ma = 20
+            long_ma = 50
+            
+            # Strategy descriptions and parameters
+            if strategy_type == "Moving Average Crossover":
+                st.info("**Strategy**: Buy when short MA crosses above long MA, sell when it crosses below")
+                short_ma = st.number_input("Short MA Period", 5, 50, 20, key="bt_short_ma")
+                long_ma = st.number_input("Long MA Period", 20, 200, 50, key="bt_long_ma")
+            elif strategy_type == "Momentum":
+                st.info("**Strategy**: Buy on strong upward momentum, sell on reversal")
+            elif strategy_type == "Mean Reversion (Bollinger)":
+                st.info("**Strategy**: Buy when price deviates below mean, sell when it returns")
+            elif strategy_type == "Breakout":
+                st.info("**Strategy**: Buy on resistance breakouts, sell on support breakdowns")
+            elif strategy_type == "Time-Series Momentum":
+                st.info("**Strategy**: Buy when short momentum crosses above long momentum")
+            elif strategy_type == "Cross-Sectional Momentum":
+                st.info("**Strategy**: Rank assets by performance, buy top performers")
+            elif strategy_type == "Volatility-Adjusted Momentum":
+                st.info("**Strategy**: Momentum adjusted for volatility (risk-adjusted)")
+            elif strategy_type == "Statistical Mean Reversion":
+                st.info("**Strategy**: Mean reversion using z-scores")
+            elif strategy_type == "VWAP Reversion":
+                st.info("**Strategy**: Mean reversion to VWAP")
+            elif strategy_type == "Volatility Breakout":
+                st.info("**Strategy**: Buy on volatility breakouts")
+            elif strategy_type == "Trench Deployment":
+                st.info("**Strategy**: Volatility-based scaling into positions")
+            elif strategy_type == "Pairs Trading":
+                st.info("**Strategy**: Trade spread between correlated assets")
+            elif strategy_type == "Beta-Neutral L/S":
+                st.info("**Strategy**: Long/short with market-neutral beta")
+            elif strategy_type == "Risk Parity":
+                st.info("**Strategy**: Equal risk contribution allocation")
+            elif strategy_type == "Mean-Variance":
+                st.info("**Strategy**: Mean-variance optimization")
+            elif strategy_type == "Auto Strategy Selector":
+                st.info("**Strategy**: Automatically selects strategy based on market regime")
+            elif strategy_type == "Inventory-Aware Trench Strategy":
+                st.info("**Strategy**: Institutional-grade inventory-aware trench execution")
+        
+        if st.button("🚀 Run Backtest", type="primary", use_container_width=True):
+            try:
+                # Fetch historical data
+                if INTEGRATIONS_AVAILABLE:
+                    try:
+                        data_provider = get_data_provider('auto')
+                        hist_data = data_provider.get_historical_data(
+                            ticker_backtest,
+                            datetime.combine(start_date_bt, datetime.min.time()),
+                            datetime.combine(end_date_bt, datetime.min.time()),
+                            interval='1d'
+                        )
+                    except:
+                        hist_data = yf.Ticker(ticker_backtest).history(
+                            start=start_date_bt,
+                            end=end_date_bt
+                        )
+                else:
+                    hist_data = yf.Ticker(ticker_backtest).history(
+                        start=start_date_bt,
+                        end=end_date_bt
+                    )
+                
+                if hist_data.empty:
+                    st.error("No data available for this ticker/period")
+                else:
+                    # Normalize timezone-aware dates to timezone-naive
+                    # yfinance returns timezone-aware dates which cause comparison issues
+                    try:
+                        if hasattr(hist_data.index, 'tz') and hist_data.index.tz is not None:
+                            hist_data.index = hist_data.index.tz_localize(None)
+                    except (TypeError, AttributeError):
+                        # Already timezone-naive or can't normalize
+                        pass
+                    
+                    # Prepare data for backtesting (ensure lowercase column names)
+                    hist_data.columns = [col.lower() for col in hist_data.columns]
+                    
+                    # Ensure we have the required columns
+                    required_cols = ['close', 'open', 'high', 'low', 'volume']
+                    for col in required_cols:
+                        if col not in hist_data.columns:
+                            # Try to find similar column names
+                            for orig_col in hist_data.columns:
+                                if col in orig_col.lower():
+                                    hist_data = hist_data.rename(columns={orig_col: col})
+                                    break
+                    
+                    # Add symbol to data attributes for strategies
+                    hist_data.attrs = {'symbol': ticker_backtest}
+                    
+                    # Create strategy instance based on selection
+                    try:
+                        from backtesting.backtest_engine import BacktestEngine, BacktestConfig
+                        from backtesting.strategies import (
+                            MovingAverageCrossoverStrategy,
+                            MomentumStrategy,
+                            MeanReversionStrategy,
+                            RSIStrategy
+                        )
+                        from backtesting.strategies_advanced import (
+                            InventoryAwareTrenchStrategy,
+                            BreakoutStrategy,
+                            TimeSeriesMomentumStrategy,
+                            CrossSectionalMomentumStrategy,
+                            VolatilityAdjustedMomentumStrategy,
+                            StatisticalMeanReversionStrategy,
+                            VWAPReversionStrategy,
+                            VolatilityBreakoutStrategy,
+                            TrenchDeploymentStrategy,
+                            PairsTradingStrategy,
+                            BetaNeutralLSStrategy,
+                            RiskParityStrategy,
+                            MeanVarianceStrategy,
+                            AutoStrategySelectorStrategy
+                        )
+                        
+                        # Create timezone-naive datetime objects
+                        # (hist_data.index already normalized above)
+                        start_dt = datetime.combine(start_date_bt, datetime.min.time())
+                        end_dt = datetime.combine(end_date_bt, datetime.min.time())
+                        
+                        # Create backtest config with portfolio type and risk:reward ratio
+                        config = BacktestConfig(
+                            initial_capital=initial_capital_bt,
+                            commission=commission_bt / 100.0,  # Convert percentage to decimal
+                            slippage=slippage_bt / 100.0,  # Convert percentage to decimal
+                            start_date=start_dt,
+                            end_date=end_dt,
+                            portfolio_type=portfolio_type_bt,
+                            risk_reward_ratio=risk_reward_ratio_bt,
+                            # Macro regime position sizing (5-Trench model)
+                            use_macro_regime=use_macro_regime_bt,
+                            macro_base_pct=macro_base_pct_bt,
+                            macro_max_pct=macro_max_pct_bt,
+                            macro_classification=classification_multiplier,
+                            macro_persona=macro_persona_bt
+                        )
+                        
+                        # Create strategy based on selection
+                        if strategy_type == "Moving Average Crossover":
+                            strategy = MovingAverageCrossoverStrategy(
+                                short_window=short_ma if 'short_ma' in locals() else 20,
+                                long_window=long_ma if 'long_ma' in locals() else 50
+                            )
+                        elif strategy_type == "Momentum":
+                            strategy = MomentumStrategy()
+                        elif strategy_type == "Mean Reversion (Bollinger)":
+                            strategy = MeanReversionStrategy()
+                        elif strategy_type == "Breakout":
+                            strategy = BreakoutStrategy()
+                        elif strategy_type == "Time-Series Momentum":
+                            strategy = TimeSeriesMomentumStrategy()
+                        elif strategy_type == "Cross-Sectional Momentum":
+                            strategy = CrossSectionalMomentumStrategy()
+                        elif strategy_type == "Volatility-Adjusted Momentum":
+                            strategy = VolatilityAdjustedMomentumStrategy()
+                        elif strategy_type == "Statistical Mean Reversion":
+                            strategy = StatisticalMeanReversionStrategy()
+                        elif strategy_type == "VWAP Reversion":
+                            strategy = VWAPReversionStrategy()
+                        elif strategy_type == "Volatility Breakout":
+                            strategy = VolatilityBreakoutStrategy()
+                        elif strategy_type == "Trench Deployment":
+                            strategy = TrenchDeploymentStrategy()
+                        elif strategy_type == "Pairs Trading":
+                            strategy = PairsTradingStrategy()
+                        elif strategy_type == "Beta-Neutral L/S":
+                            strategy = BetaNeutralLSStrategy()
+                        elif strategy_type == "Risk Parity":
+                            strategy = RiskParityStrategy()
+                        elif strategy_type == "Mean-Variance":
+                            strategy = MeanVarianceStrategy()
+                        elif strategy_type == "Auto Strategy Selector":
+                            strategy = AutoStrategySelectorStrategy()
+                        elif strategy_type == "Inventory-Aware Trench Strategy":
+                            # Set base_position_pct to 1.0 to allow full position sizing control via risk_per_trade
+                            # Set max_position_pct to 0.15 (15% per instrument) for incremental trench deployment
+                            strategy = InventoryAwareTrenchStrategy(
+                                base_position_pct=1.0,
+                                max_position_pct=0.15  # 15% cap per instrument
+                            )
+                        else:
+                            strategy = MomentumStrategy()  # Default fallback
+                        
+                        # Run backtest(s)
+                        engine = BacktestEngine(config)
+                        data_dict = {ticker_backtest: hist_data}
+                        result = engine.run(strategy, data_dict)
+                        
+                        # If comparison mode enabled, also run without macro regime
+                        result_without_macro = None
+                        engine_without_macro = None
+                        
+                        # Check if comparison mode is enabled using session state (Streamlit widget state)
+                        comparison_enabled = False
+                        if config.use_macro_regime:
+                            # Access the checkbox value from session state
+                            comparison_enabled = st.session_state.get('backtest_compare_macro', False)
+                        
+                        if comparison_enabled and config.use_macro_regime:
+                            # Create config without macro regime
+                            config_no_macro = BacktestConfig(
+                                initial_capital=config.initial_capital,
+                                commission=config.commission,
+                                slippage=config.slippage,
+                                start_date=config.start_date,
+                                end_date=config.end_date,
+                                portfolio_type=config.portfolio_type,
+                                risk_reward_ratio=config.risk_reward_ratio,
+                                use_macro_regime=False
+                            )
+                            
+                            # Create fresh strategy instance (same type as current)
+                            if strategy_type == "Inventory-Aware Trench Strategy":
+                                strategy_no_macro = InventoryAwareTrenchStrategy(
+                                    base_position_pct=1.0,
+                                    max_position_pct=0.15
+                                )
+                            elif strategy_type == "Moving Average Crossover":
+                                strategy_no_macro = MovingAverageCrossoverStrategy(
+                                    short_window=short_ma if 'short_ma' in locals() else 20,
+                                    long_window=long_ma if 'long_ma' in locals() else 50
+                                )
+                            elif strategy_type == "Momentum":
+                                strategy_no_macro = MomentumStrategy()
+                            elif strategy_type == "Mean Reversion (Bollinger)":
+                                strategy_no_macro = MeanReversionStrategy()
+                            elif strategy_type == "Breakout":
+                                strategy_no_macro = BreakoutStrategy()
+                            elif strategy_type == "Time-Series Momentum":
+                                strategy_no_macro = TimeSeriesMomentumStrategy()
+                            elif strategy_type == "Cross-Sectional Momentum":
+                                strategy_no_macro = CrossSectionalMomentumStrategy()
+                            elif strategy_type == "Volatility-Adjusted Momentum":
+                                strategy_no_macro = VolatilityAdjustedMomentumStrategy()
+                            elif strategy_type == "Statistical Mean Reversion":
+                                strategy_no_macro = StatisticalMeanReversionStrategy()
+                            elif strategy_type == "VWAP Reversion":
+                                strategy_no_macro = VWAPReversionStrategy()
+                            elif strategy_type == "Volatility Breakout":
+                                strategy_no_macro = VolatilityBreakoutStrategy()
+                            elif strategy_type == "Trench Deployment":
+                                strategy_no_macro = TrenchDeploymentStrategy()
+                            elif strategy_type == "Pairs Trading":
+                                strategy_no_macro = PairsTradingStrategy()
+                            elif strategy_type == "Beta-Neutral L/S":
+                                strategy_no_macro = BetaNeutralLSStrategy()
+                            elif strategy_type == "Risk Parity":
+                                strategy_no_macro = RiskParityStrategy()
+                            elif strategy_type == "Mean-Variance":
+                                strategy_no_macro = MeanVarianceStrategy()
+                            elif strategy_type == "Auto Strategy Selector":
+                                strategy_no_macro = AutoStrategySelectorStrategy()
+                            else:
+                                strategy_no_macro = MomentumStrategy()  # Default fallback
+                            
+                            # Run comparison backtest
+                            with st.spinner("🔄 Running comparison backtest (without macro regime)..."):
+                                engine_without_macro = BacktestEngine(config_no_macro)
+                                result_without_macro = engine_without_macro.run(strategy_no_macro, data_dict)
+                        
+                        # Display results
+                        comparison_enabled_check = st.session_state.get('backtest_compare_macro', False)
+                        
+                        if comparison_enabled_check and result_without_macro:
+                            st.success(f"✅ Backtest completed! Strategy: {strategy.name} | Comparison mode: Enabled")
+                        else:
+                            st.success(f"✅ Backtest completed! Strategy: {strategy.name}")
+                        
+                        # Display Regime Adaptive Strategy Selection (if applicable)
+                        if strategy_type == "Auto Strategy Selector":
+                            try:
+                                regime_summary = strategy.get_regime_summary()
+                                if regime_summary and regime_summary.get("total_days", 0) > 0:
+                                    st.markdown("### 🎯 Regime Adaptive Strategy Selection")
+                                    
+                                    col_regime1, col_regime2 = st.columns(2)
+                                    
+                                    with col_regime1:
+                                        st.markdown("#### 📊 Current Selection")
+                                        current_strategy = regime_summary.get("current_strategy", "Unknown")
+                                        current_regime = regime_summary.get("current_regime", "unknown")
+                                        
+                                        regime_icons = {
+                                            "mean_reverting": "🔄",
+                                            "trending": "📈",
+                                            "momentum": "🚀"
+                                        }
+                                        icon = regime_icons.get(current_regime, "📊")
+                                        
+                                        st.info(f"{icon} **Current Regime**: {current_regime.replace('_', ' ').title()}\n\n"
+                                               f"**Selected Strategy**: {current_strategy}")
+                                    
+                                    with col_regime2:
+                                        st.markdown("#### 📈 Strategy Usage Summary")
+                                        strategy_counts = regime_summary.get("strategy_counts", {})
+                                        if strategy_counts:
+                                            for strategy_name, count in sorted(strategy_counts.items(), key=lambda x: x[1], reverse=True):
+                                                percentage = (count / regime_summary.get("total_days", 1)) * 100
+                                                st.metric(
+                                                    strategy_name,
+                                                    f"{count} days",
+                                                    f"{percentage:.1f}%"
+                                                )
+                                    
+                                    # Regime breakdown
+                                    st.markdown("#### 🔄 Regime Breakdown")
+                                    regime_counts = regime_summary.get("regime_counts", {})
+                                    if regime_counts:
+                                        regime_df = pd.DataFrame([
+                                            {
+                                                "Regime": regime.replace("_", " ").title(),
+                                                "Days": count,
+                                                "Percentage": f"{(count / regime_summary.get('total_days', 1)) * 100:.1f}%",
+                                                "Strategy": strategy.strategy_mapping.get(regime, "Unknown")
+                                            }
+                                            for regime, count in sorted(regime_counts.items(), key=lambda x: x[1], reverse=True)
+                                        ])
+                                        st.dataframe(regime_df, use_container_width=True, hide_index=True)
+                                    
+                                    st.markdown("---")
+                            except Exception as e:
+                                # If regime summary not available, continue without it
+                                pass
+                        
+                        # Display Portfolio Type Info
+                        portfolio_type_info = {
+                            "Scalping": {"icon": "⚡", "color": "orange"},
+                            "Intraday": {"icon": "📅", "color": "blue"},
+                            "Swing": {"icon": "📊", "color": "green"},
+                            "Positional": {"icon": "📈", "color": "purple"},
+                            "Long-Term": {"icon": "🏛️", "color": "gray"},
+                            "Long term": {"icon": "🏛️", "color": "gray"}  # Legacy support
+                        }
+                        pt_info = portfolio_type_info.get(portfolio_type_bt, {"icon": "📊", "color": "green"})
+                        
+                        # Normalize portfolio type for display (handle "Long term" vs "Long-Term")
+                        portfolio_type_normalized = portfolio_type_bt.replace(" ", "-")
+                        if portfolio_type_normalized == "Long-term":
+                            portfolio_type_normalized = "Long-Term"
+                        
+                        # Get portfolio config for display
+                        portfolio_config_display = BacktestEngine._get_portfolio_type_config(portfolio_type_normalized)
+                        risk_reward_selected = config.risk_reward_ratio or portfolio_config_display.get('risk_reward_default', 2.0)
+                        
+                        st.info(f"{pt_info['icon']} **Portfolio Type**: {portfolio_type_bt} - "
+                               f"Holding period constraints applied | "
+                               f"**Risk:Reward**: {risk_reward_selected:.1f}:1")
+                        
+                        # Display Institutional Benchmark Table
+                        st.markdown("### ✅ Institutional Benchmark Table")
+                        
+                        # Get configs for all portfolio types
+                        scalping_config = BacktestEngine._get_portfolio_type_config("Scalping")
+                        intraday_config = BacktestEngine._get_portfolio_type_config("Intraday")
+                        swing_config = BacktestEngine._get_portfolio_type_config("Swing")
+                        positional_config = BacktestEngine._get_portfolio_type_config("Positional")
+                        longterm_config = BacktestEngine._get_portfolio_type_config("Long-Term")
+                        
+                        benchmark_data = {
+                            "Portfolio Type": ["Scalping", "Intraday", "Swing", "Positional", "Long-Term"],
+                            "Time Horizon": [
+                                scalping_config.get('time_horizon', 'Seconds–Minutes'),
+                                intraday_config.get('time_horizon', 'Minutes–Hours'),
+                                swing_config.get('time_horizon', 'Days–Weeks'),
+                                positional_config.get('time_horizon', 'Weeks–Months'),
+                                longterm_config.get('time_horizon', 'Months–Years')
+                            ],
+                            "Typical Win Rate": [
+                                f"{scalping_config.get('typical_win_rate', (60, 80))[0]}–{scalping_config.get('typical_win_rate', (60, 80))[1]}%",
+                                f"{intraday_config.get('typical_win_rate', (45, 60))[0]}–{intraday_config.get('typical_win_rate', (45, 60))[1]}%",
+                                f"{swing_config.get('typical_win_rate', (40, 55))[0]}–{swing_config.get('typical_win_rate', (40, 55))[1]}%",
+                                f"{positional_config.get('typical_win_rate', (30, 45))[0]}–{positional_config.get('typical_win_rate', (30, 45))[1]}%",
+                                f"{longterm_config.get('typical_win_rate', (20, 35))[0]}–{longterm_config.get('typical_win_rate', (20, 35))[1]}%"
+                            ],
+                            "Acceptable Risk:Reward": [
+                                f"{scalping_config.get('risk_reward_min', 0.3):.1f}–{scalping_config.get('risk_reward_max', 0.8):.1f}:1",
+                                f"{intraday_config.get('risk_reward_min', 0.8):.1f}–{intraday_config.get('risk_reward_max', 1.5):.1f}:1",
+                                f"{swing_config.get('risk_reward_min', 1.5):.1f}–{swing_config.get('risk_reward_max', 3.0):.1f}:1",
+                                f"{positional_config.get('risk_reward_min', 2.5):.1f}–{positional_config.get('risk_reward_max', 5.0):.1f}:1",
+                                f"{longterm_config.get('risk_reward_min', 4.0):.1f}–{longterm_config.get('risk_reward_max', 10.0):.1f}:1"
+                            ],
+                            "Institutional Logic": [
+                                scalping_config.get('institutional_logic', 'Micro-edge, high turnover'),
+                                intraday_config.get('institutional_logic', 'Volatility harvesting'),
+                                swing_config.get('institutional_logic', 'Core alpha engine'),
+                                positional_config.get('institutional_logic', 'Trend persistence'),
+                                longterm_config.get('institutional_logic', 'Convex payoff, beta + alpha')
+                            ]
+                        }
+                        
+                        benchmark_df = pd.DataFrame(benchmark_data)
+                        
+                        # Highlight current portfolio type row
+                        def highlight_row(row):
+                            # Normalize comparison
+                            row_type = row['Portfolio Type']
+                            if row_type == portfolio_type_bt or (row_type == "Long-Term" and portfolio_type_bt == "Long term"):
+                                return ['background-color: #e0f2fe; font-weight: bold'] * len(row)
+                            return [''] * len(row)
+                        
+                        st.dataframe(
+                            benchmark_df.style.apply(highlight_row, axis=1),
+                            use_container_width=True,
+                            hide_index=True
+                        )
+                        
+                        # Show selected risk:reward ratio prominently
+                        st.success(f"🎯 **Active Risk:Reward Ratio**: **{risk_reward_selected:.1f}:1** "
+                                  f"(Range: {portfolio_config_display.get('risk_reward_min', 0.3):.1f}:1 - "
+                                  f"{portfolio_config_display.get('risk_reward_max', 10.0):.1f}:1)")
+                        
+                        # Show macro regime information if enabled
+                        if config.use_macro_regime and hasattr(engine, 'macro_regime_detector') and engine.macro_regime_detector:
+                            st.markdown("### 🏛️ Macro Regime Analysis")
+                            regime_summary = engine.macro_regime_detector.get_regime_summary()
+                            
+                            if regime_summary:
+                                col_regime1, col_regime2, col_regime3 = st.columns(3)
+                                
+                                with col_regime1:
+                                    risk_on_pct = regime_summary.get('regimes', {}).get('risk_on', {}).get('percentage', 0)
+                                    st.metric("Risk-On Periods", f"{risk_on_pct:.1f}%")
+                                    st.caption("Favorable conditions (1.2x-1.5x)")
+                                
+                                with col_regime2:
+                                    neutral_pct = regime_summary.get('regimes', {}).get('neutral', {}).get('percentage', 0)
+                                    st.metric("Neutral Periods", f"{neutral_pct:.1f}%")
+                                    st.caption("Normal conditions (1.0x)")
+                                
+                                with col_regime3:
+                                    risk_off_pct = regime_summary.get('regimes', {}).get('risk_off', {}).get('percentage', 0)
+                                    st.metric("Risk-Off Periods", f"{risk_off_pct:.1f}%")
+                                    st.caption("Unfavorable conditions (0.3x-0.7x)")
+                                
+                                avg_multiplier = regime_summary.get('avg_multiplier', 1.0)
+                                st.info(f"📊 **Average Regime Multiplier**: **{avg_multiplier:.2f}x** "
+                                       f"(Based on VIX, yield curves, and market conditions)")
+                                
+                                # Show position sizing breakdowns if available
+                                if hasattr(engine, 'position_sizing_breakdowns') and engine.position_sizing_breakdowns:
+                                    st.markdown("#### 📈 Position Sizing Breakdown (5-Trench Model)")
+                                    breakdown_data = []
+                                    for bd in engine.position_sizing_breakdowns[-10:]:  # Show last 10
+                                        breakdown = bd['breakdown']
+                                        row = {
+                                            'Date': bd['date'].strftime('%Y-%m-%d') if hasattr(bd['date'], 'strftime') else str(bd['date']),
+                                            'Symbol': bd['symbol'],
+                                            'Base %': f"{breakdown['base_pct']*100:.2f}%",
+                                            'Volatility': f"{breakdown['volatility_multiplier']:.2f}x",
+                                            'Regime': f"{breakdown['regime_multiplier']:.2f}x",
+                                            'Classification': f"{breakdown['classification_multiplier']:.2f}x",
+                                            'Persona': f"{breakdown['persona_multiplier']:.2f}x",
+                                            'Final %': f"{breakdown['final_pct']*100:.2f}%",
+                                            'Position Value': f"${breakdown['position_value']:,.2f}"
+                                        }
+                                        # Add macro-adjusted info if available
+                                        if breakdown.get('macro_adjusted'):
+                                            row['Total Target'] = f"{breakdown.get('total_target_pct', 0)*100:.2f}%"
+                                            row['Per Trench'] = f"{breakdown.get('per_trench_pct', 0)*100:.2f}%"
+                                            row['Trenches'] = f"{breakdown.get('num_trenches_target', 0):.1f}"
+                                            # Show regime multiplier at deployment time
+                                            regime_at_deploy = breakdown.get('regime_at_deployment', breakdown.get('regime_multiplier', 1.0))
+                                            row['Regime @ Deploy'] = f"{regime_at_deploy:.2f}x"
+                                        breakdown_data.append(row)
+                                    if breakdown_data:
+                                        breakdown_df = pd.DataFrame(breakdown_data)
+                                        st.dataframe(breakdown_df, use_container_width=True, hide_index=True)
+                                        st.caption("Showing last 10 position sizing decisions using 5-Trench model")
+                                        
+                                        # Show comparison with standard sizing
+                                        if len(breakdown_data) > 0:
+                                            avg_final_pct = np.mean([float(bd['Final %'].rstrip('%')) for bd in breakdown_data]) / 100
+                                            
+                                            # Calculate what standard sizing would be
+                                            portfolio_config = BacktestEngine._get_portfolio_type_config(config.portfolio_type)
+                                            if config.portfolio_type in ["Long-Term", "Long term", "Positional"]:
+                                                standard_pct = 0.10  # 10% for long-term
+                                            elif config.portfolio_type == "Swing":
+                                                standard_pct = 0.075  # 7.5% for swing
+                                            elif config.portfolio_type == "Intraday":
+                                                standard_pct = 0.06  # 6% for intraday
+                                            else:
+                                                standard_pct = 0.05  # 5% for scalping
+                                            
+                                            diff_pct = (avg_final_pct - standard_pct) * 100
+                                            diff_pct_abs = abs(diff_pct)
+                                            
+                                            if diff_pct_abs > 0.5:  # Significant difference
+                                                if diff_pct > 0:
+                                                    st.success(f"📈 **Macro-Regime Impact**: Average position size ({avg_final_pct*100:.2f}%) is **{diff_pct:+.2f}%** higher than standard ({standard_pct*100:.1f}%)")
+                                                else:
+                                                    st.warning(f"📉 **Macro-Regime Impact**: Average position size ({avg_final_pct*100:.2f}%) is **{diff_pct:.2f}%** lower than standard ({standard_pct*100:.1f}%)")
+                                            else:
+                                                st.warning(f"⚠️ **Macro-Regime Impact**: Average position size ({avg_final_pct*100:.2f}%) is **identical** to standard ({standard_pct*100:.1f}%)")
+                                            
+                                            st.caption(f"💡 **Formula**: Base ({breakdown_data[0]['Base %']}) × Volatility × Regime × Classification × Persona = Final Position %")
+                                            
+                                            # Show detailed comparison
+                                            if len(breakdown_data) > 0:
+                                                # Calculate average multipliers
+                                                avg_base = np.mean([float(bd['Base %'].rstrip('%')) for bd in breakdown_data]) / 100
+                                                avg_vol = np.mean([float(bd['Volatility'].rstrip('x')) for bd in breakdown_data])
+                                                avg_regime = np.mean([float(bd['Regime'].rstrip('x')) for bd in breakdown_data])
+                                                avg_class = np.mean([float(bd['Classification'].rstrip('x')) for bd in breakdown_data])
+                                                avg_persona = np.mean([float(bd['Persona'].rstrip('x')) for bd in breakdown_data])
+                                                
+                                                # Show why they match
+                                                st.markdown("#### 🔍 **Why Results Are Identical:**")
+                                                st.write(f"**Macro Calculation**: {avg_base*100:.2f}% × {avg_vol:.2f}x × {avg_regime:.2f}x × {avg_class:.2f}x × {avg_persona:.2f}x = **{avg_final_pct*100:.2f}%**")
+                                                st.write(f"**Standard Sizing**: **{standard_pct*100:.1f}%** (portfolio type default)")
+                                                
+                                                # Check if macro-adjusted breakdown exists
+                                                has_macro_adjusted = any(bd.get('Total Target') for bd in breakdown_data if 'Total Target' in bd)
+                                                
+                                                if has_macro_adjusted:
+                                                    avg_per_trench = np.mean([float(bd.get('Per Trench', '0%').rstrip('%')) for bd in breakdown_data if 'Per Trench' in bd]) / 100
+                                                    st.write(f"**Per-Trench Size**: {avg_per_trench*100:.2f}% (capped at 5% = max_position_pct/trench_levels)")
+                                                    st.warning("⚠️ **For Trench Strategies**: Macro regime calculates total position, but per-trench size is capped at `max_position_pct / trench_levels` (15% / 3 = 5%). "
+                                                             "If macro calculates 15% total, it becomes 5% per trench × 3 trenches, which matches standard sizing!")
+                                                
+                                                if abs(avg_regime - 1.0) < 0.01:
+                                                    st.warning(f"⚠️ **Regime multiplier is neutral (1.0x)** - market conditions are neither strongly risk-on nor risk-off, so macro regime has no effect.")
+                                                elif abs(avg_final_pct - standard_pct) < 0.001:
+                                                    st.warning(f"⚠️ **Macro calculation equals standard** - despite different multipliers, the final position size matches standard sizing by coincidence.")
+                                                else:
+                                                    st.info(f"✅ **Macro regime is active** - position sizes differ from standard, but final results may be similar due to trade timing or other factors.")
+                                        
+                                        # Show comparison with standard sizing
+                                        if len(breakdown_data) > 0:
+                                            avg_final_pct = np.mean([float(bd['Final %'].rstrip('%')) for bd in breakdown_data]) / 100
+                                            st.info(f"📊 **Average Macro-Regime Position Size**: {avg_final_pct*100:.2f}% "
+                                                   f"(vs Standard ~10% for Long-Term). "
+                                                   f"Regime multiplier: {regime_summary.get('avg_multiplier', 1.0):.2f}x")
+                        
+                        # Performance Metrics
+                        st.markdown("### 📊 Performance Metrics")
+                        col_perf1, col_perf2, col_perf3, col_perf4 = st.columns(4)
+                        
+                        # Helper function to format metric with comparison
+                        def format_metric_with_comparison(label, value, value_without=None, format_str="{:.2%}", is_percent=True):
+                            if value_without is not None:
+                                comparison = f" (vs {format_str.format(value_without)} without macro)"
+                                return label, f"{format_str.format(value)}{comparison}"
+                            return label, format_str.format(value)
+                        
+                        with col_perf1:
+                            label, val = format_metric_with_comparison(
+                                "Total Return", result.total_return,
+                                result_without_macro.total_return if result_without_macro else None
+                            )
+                            st.metric(label, val)
+                            
+                            label, val = format_metric_with_comparison(
+                                "Annualized Return", result.annualized_return,
+                                result_without_macro.annualized_return if result_without_macro else None
+                            )
+                            st.metric(label, val)
+                        
+                        with col_perf2:
+                            label, val = format_metric_with_comparison(
+                                "Sharpe Ratio", result.sharpe_ratio,
+                                result_without_macro.sharpe_ratio if result_without_macro else None,
+                                format_str="{:.2f}", is_percent=False
+                            )
+                            st.metric(label, val)
+                            
+                            label, val = format_metric_with_comparison(
+                                "Sortino Ratio", result.sortino_ratio,
+                                result_without_macro.sortino_ratio if result_without_macro else None,
+                                format_str="{:.2f}", is_percent=False
+                            )
+                            st.metric(label, val)
+                        
+                        with col_perf3:
+                            label, val = format_metric_with_comparison(
+                                "Max Drawdown", result.max_drawdown,
+                                result_without_macro.max_drawdown if result_without_macro else None
+                            )
+                            st.metric(label, val)
+                            
+                            label, val = format_metric_with_comparison(
+                                "Win Rate", result.win_rate,
+                                result_without_macro.win_rate if result_without_macro else None
+                            )
+                            st.metric(label, val)
+                        
+                        with col_perf4:
+                            label, val = format_metric_with_comparison(
+                                "Profit Factor", result.profit_factor,
+                                result_without_macro.profit_factor if result_without_macro else None,
+                                format_str="{:.2f}", is_percent=False
+                            )
+                            st.metric(label, val)
+                            
+                            label, val = format_metric_with_comparison(
+                                "Total Trades", result.total_trades,
+                                result_without_macro.total_trades if result_without_macro else None,
+                                format_str="{:.0f}", is_percent=False
+                            )
+                            st.metric(label, val)
+                        
+                        # P&L Metrics
+                        st.markdown("### 💰 Profit & Loss (P&L)")
+                        
+                        # Get currency symbol based on ticker
+                        try:
+                            currency_symbol = get_currency_symbol(ticker_backtest)
+                        except:
+                            currency_symbol = "$"  # Default to USD
+                        
+                        col_pnl1, col_pnl2, col_pnl3 = st.columns(3)
+                        
+                        with col_pnl1:
+                            # Format P&L with currency symbol
+                            pnl_color = "normal" if result.total_pnl >= 0 else "inverse"
+                            pnl_delta = f"{result.total_pnl_percent:+.2f}%"
+                            
+                            # Add comparison if available
+                            pnl_label = "Total P&L"
+                            pnl_value = f"{currency_symbol}{result.total_pnl:,.2f}"
+                            if result_without_macro:
+                                pnl_value += f" (vs {currency_symbol}{result_without_macro.total_pnl:,.2f} without macro)"
+                            
+                            st.metric(
+                                pnl_label,
+                                pnl_value,
+                                delta=pnl_delta,
+                                delta_color=pnl_color
+                            )
+                            st.caption("💰 Absolute profit/loss")
+                        
+                        with col_pnl2:
+                            pnl_percent_color = "normal" if result.total_pnl_percent >= 0 else "inverse"
+                            
+                            pnl_pct_label = "P&L % (Total Capital)"
+                            pnl_pct_value = f"{result.total_pnl_percent:+.2f}%"
+                            if result_without_macro:
+                                pnl_pct_value += f" (vs {result_without_macro.total_pnl_percent:+.2f}% without macro)"
+                            
+                            st.metric(
+                                pnl_pct_label,
+                                pnl_pct_value,
+                                delta=f"{currency_symbol}{result.total_pnl:,.2f}",
+                                delta_color=pnl_percent_color
+                            )
+                            st.caption(f"📊 Return on ${initial_capital_bt:,.0f} total capital")
+                        
+                        with col_pnl3:
+                            # Show P&L % on deployed capital (more accurate for strategy performance)
+                            if hasattr(result, 'total_pnl_percent_deployed') and result.total_capital_deployed > 0:
+                                deployed_pnl_color = "normal" if result.total_pnl_percent_deployed >= 0 else "inverse"
+                                
+                                deployed_label = "P&L % (Deployed Capital)"
+                                deployed_value = f"{result.total_pnl_percent_deployed:+.2f}%"
+                                if result_without_macro and hasattr(result_without_macro, 'total_pnl_percent_deployed'):
+                                    deployed_value += f" (vs {result_without_macro.total_pnl_percent_deployed:+.2f}% without macro)"
+                                
+                                st.metric(
+                                    deployed_label,
+                                    deployed_value,
+                                    delta=f"{currency_symbol}{result.total_pnl:,.2f}",
+                                    delta_color=deployed_pnl_color
+                                )
+                                deployment_pct = (result.total_capital_deployed / initial_capital_bt) * 100
+                                st.caption(f"🎯 Return on {currency_symbol}{result.total_capital_deployed:,.0f} deployed ({deployment_pct:.1f}% of capital)")
+                            else:
+                                st.metric(
+                                    "P&L % (Deployed Capital)",
+                                    "N/A",
+                                    delta="No trades"
+                                )
+                                st.caption("💡 Shows return on capital actually used")
+                        
+                        # Trade Statistics
+                        st.markdown("### 📈 Trade Statistics")
+                        col_trade1, col_trade2, col_trade3 = st.columns(3)
+                        
+                        with col_trade1:
+                            st.metric("Winning Trades", f"{result.winning_trades}")
+                            # Calculate actual average win in dollars
+                            if result.winning_trades > 0 and result.total_pnl > 0:
+                                # Average win per winning trade in dollars
+                                avg_win_dollar = result.total_pnl / result.winning_trades
+                                st.metric("Average Win", f"{currency_symbol}{avg_win_dollar:,.2f}")
+                                # Also show as percentage if we can calculate
+                                if result.trades:
+                                    buy_trades = [t for t in result.trades if t.get('action') == 'BUY']
+                                    if buy_trades:
+                                        avg_cost = np.mean([t.get('cost', t.get('price', 0) * t.get('quantity', 0)) for t in buy_trades])
+                                        if avg_cost > 0:
+                                            avg_win_pct = (avg_win_dollar / avg_cost) * 100
+                                            st.caption(f"({avg_win_pct:.2f}% per trade)")
+                            else:
+                                # Fallback to percentage display
+                                if abs(result.average_win) > 1:
+                                    st.metric("Average Win", f"{result.average_win:.2%}")
+                                else:
+                                    st.metric("Average Win", f"{currency_symbol}{result.average_win:,.2f}")
+                        
+                        with col_trade2:
+                            st.metric("Losing Trades", f"{result.losing_trades}")
+                            if result.losing_trades > 0:
+                                # Calculate actual average loss in dollars
+                                losing_trades_pnl = [t for t in result.trades if t.get('action') == 'SELL' and 
+                                                    t.get('proceeds', 0) - t.get('cost', 0) < 0]
+                                if losing_trades_pnl:
+                                    avg_loss_dollar = abs(np.mean([t.get('proceeds', 0) - t.get('cost', 0) for t in losing_trades_pnl]))
+                                    st.metric("Average Loss", f"{currency_symbol}{avg_loss_dollar:,.2f}")
+                                else:
+                                    st.metric("Average Loss", f"{currency_symbol}0.00")
+                            else:
+                                st.metric("Average Loss", f"{currency_symbol}0.00")
+                        
+                        with col_trade3:
+                            st.metric("Max DD Duration", f"{result.max_drawdown_duration} days")
+                            
+                            # Show average position size if available
+                            if result.trades:
+                                buy_trades = [t for t in result.trades if t.get('action') == 'BUY']
+                                if buy_trades:
+                                    # For trench strategies, calculate cumulative position size per symbol
+                                    symbol_positions = {}
+                                    for trade in buy_trades:
+                                        symbol = trade.get('symbol', 'UNKNOWN')
+                                        trade_cost = trade.get('cost', trade.get('price', 0) * trade.get('quantity', 0))
+                                        if symbol not in symbol_positions:
+                                            symbol_positions[symbol] = []
+                                        symbol_positions[symbol].append(trade_cost)
+                                    
+                                    # Calculate average cumulative position per symbol
+                                    cumulative_positions = [sum(costs) for costs in symbol_positions.values()]
+                                    avg_per_trade = np.mean([
+                                        t.get('cost', t.get('price', 0) * t.get('quantity', 0))
+                                        for t in buy_trades
+                                    ])
+                                    
+                                    if cumulative_positions:
+                                        avg_cumulative_position = np.mean(cumulative_positions)
+                                        
+                                        # If cumulative is significantly higher than per-trade, it's a trench strategy
+                                        if avg_cumulative_position > avg_per_trade * 1.5:
+                                            # Show cumulative position size for trench strategies
+                                            st.metric("Avg Position Size", f"{currency_symbol}{avg_cumulative_position:,.2f}")
+                                            position_pct = (avg_cumulative_position / initial_capital_bt) * 100
+                                            st.caption(f"({position_pct:.1f}% of capital - cumulative per symbol)")
+                                        else:
+                                            # Show per-trade average for non-trench strategies
+                                            st.metric("Avg Position Size", f"{currency_symbol}{avg_per_trade:,.2f}")
+                                            position_pct = (avg_per_trade / initial_capital_bt) * 100
+                                            st.caption(f"({position_pct:.1f}% of capital)")
+                                    else:
+                                        avg_position_value = avg_per_trade
+                                        st.metric("Avg Position Size", f"{currency_symbol}{avg_position_value:,.2f}")
+                                        position_pct = (avg_position_value / initial_capital_bt) * 100
+                                        st.caption(f"({position_pct:.1f}% of capital)")
+                        
+                        # P&L Analysis Section
+                        if result.total_pnl > 0 and result.winning_trades > 0:
+                            st.markdown("### 🔍 P&L Analysis")
+                            
+                            # Calculate key metrics
+                            avg_win_per_trade = result.total_pnl / result.winning_trades
+                            total_trade_count = result.winning_trades + result.losing_trades
+                            avg_pnl_per_trade = result.total_pnl / total_trade_count if total_trade_count > 0 else 0
+                            
+                            # Calculate position metrics BEFORE columns (for use in diagnostics)
+                            avg_position_value = 0.0
+                            is_trench_strategy = False
+                            
+                            if result.trades:
+                                buy_trades = [t for t in result.trades if t.get('action') == 'BUY']
+                                if buy_trades:
+                                    # For trench strategies, calculate cumulative position size per symbol
+                                    symbol_positions = {}
+                                    for trade in buy_trades:
+                                        symbol = trade.get('symbol', 'UNKNOWN')
+                                        trade_cost = trade.get('cost', trade.get('price', 0) * trade.get('quantity', 0))
+                                        if symbol not in symbol_positions:
+                                            symbol_positions[symbol] = []
+                                        symbol_positions[symbol].append(trade_cost)
+                                    
+                                    # Calculate average cumulative position per symbol
+                                    cumulative_positions = [sum(costs) for costs in symbol_positions.values()]
+                                    avg_per_trade = np.mean([
+                                        t.get('cost', t.get('price', 0) * t.get('quantity', 0))
+                                        for t in buy_trades
+                                    ])
+                                    
+                                    if cumulative_positions:
+                                        avg_cumulative_position = np.mean(cumulative_positions)
+                                        # If cumulative is significantly higher than per-trade, it's a trench strategy
+                                        is_trench_strategy = avg_cumulative_position > avg_per_trade * 1.5
+                                        avg_position_value = avg_cumulative_position if is_trench_strategy else avg_per_trade
+                                    else:
+                                        avg_position_value = avg_per_trade
+                            
+                            col_analysis1, col_analysis2, col_analysis3 = st.columns(3)
+                            
+                            # Calculate comparison values if available
+                            avg_pnl_per_trade_no_macro = None
+                            avg_position_value_no_macro = None
+                            capital_utilization_no_macro = None
+                            
+                            if result_without_macro:
+                                if result_without_macro.trades:
+                                    buy_trades_no_macro = [t for t in result_without_macro.trades if t.get('action') == 'BUY']
+                                    if buy_trades_no_macro:
+                                        total_trade_count_no_macro = result_without_macro.winning_trades + result_without_macro.losing_trades
+                                        avg_pnl_per_trade_no_macro = result_without_macro.total_pnl / total_trade_count_no_macro if total_trade_count_no_macro > 0 else 0
+                                        
+                                        # Calculate position size for comparison
+                                        symbol_positions_no_macro = {}
+                                        for trade in buy_trades_no_macro:
+                                            symbol = trade.get('symbol', 'UNKNOWN')
+                                            trade_cost = trade.get('cost', trade.get('price', 0) * trade.get('quantity', 0))
+                                            if symbol not in symbol_positions_no_macro:
+                                                symbol_positions_no_macro[symbol] = []
+                                            symbol_positions_no_macro[symbol].append(trade_cost)
+                                        
+                                        cumulative_positions_no_macro = [sum(costs) for costs in symbol_positions_no_macro.values()]
+                                        avg_per_trade_no_macro = np.mean([
+                                            t.get('cost', t.get('price', 0) * t.get('quantity', 0))
+                                            for t in buy_trades_no_macro
+                                        ])
+                                        
+                                        if cumulative_positions_no_macro:
+                                            avg_cumulative_no_macro = np.mean(cumulative_positions_no_macro)
+                                            is_trench_no_macro = avg_cumulative_no_macro > avg_per_trade_no_macro * 1.5
+                                            avg_position_value_no_macro = avg_cumulative_no_macro if is_trench_no_macro else avg_per_trade_no_macro
+                                        else:
+                                            avg_position_value_no_macro = avg_per_trade_no_macro
+                                        
+                                        if avg_position_value_no_macro > 0:
+                                            capital_utilization_no_macro = (avg_position_value_no_macro / initial_capital_bt) * 100
+                            
+                            with col_analysis1:
+                                profit_label = "Avg Profit per Trade"
+                                profit_value = f"{currency_symbol}{avg_pnl_per_trade:,.2f}"
+                                if avg_pnl_per_trade_no_macro is not None:
+                                    profit_value += f" (vs {currency_symbol}{avg_pnl_per_trade_no_macro:,.2f} without macro)"
+                                st.metric(profit_label, profit_value)
+                                st.caption(f"Total P&L / {total_trade_count} trades")
+                            
+                            with col_analysis2:
+                                if avg_position_value > 0:
+                                    position_pct = (avg_position_value / initial_capital_bt) * 100
+                                    position_label = "Avg Position %"
+                                    position_value = f"{position_pct:.1f}%"
+                                    if avg_position_value_no_macro is not None and avg_position_value_no_macro > 0:
+                                        position_pct_no_macro = (avg_position_value_no_macro / initial_capital_bt) * 100
+                                        position_value += f" (vs {position_pct_no_macro:.1f}% without macro)"
+                                    st.metric(position_label, position_value)
+                                    if is_trench_strategy:
+                                        st.caption(f"Cumulative per symbol (${initial_capital_bt:,.0f} capital)")
+                                    else:
+                                        st.caption(f"Per trade (${initial_capital_bt:,.0f} capital)")
+                            
+                            with col_analysis3:
+                                # Calculate expected P&L if using more capital
+                                if avg_position_value > 0:
+                                    capital_utilization = (avg_position_value / initial_capital_bt) * 100
+                                    util_label = "Capital Utilization"
+                                    util_value = f"{capital_utilization:.1f}%"
+                                    if capital_utilization_no_macro is not None:
+                                        util_value += f" (vs {capital_utilization_no_macro:.1f}% without macro)"
+                                    st.metric(util_label, util_value)
+                                    if is_trench_strategy:
+                                        st.caption("Avg cumulative position / Total capital")
+                                    else:
+                                        st.caption("Avg position / Total capital")
+                            
+                            # Why P&L might be low - diagnostic info
+                            st.markdown("#### 💡 Why P&L Might Be Low:")
+                            diagnostic_points = []
+                            
+                            if avg_position_value < initial_capital_bt * 0.05:
+                                diagnostic_points.append(f"⚠️ **Small Position Sizes**: Average position ({currency_symbol}{avg_position_value:,.2f}) is only {(avg_position_value/initial_capital_bt)*100:.1f}% of capital. Consider increasing position sizing.")
+                            
+                            # Compare profit per trade to position size, not total capital (more accurate)
+                            if avg_position_value > 0:
+                                profit_as_pct_of_position = (avg_win_per_trade / avg_position_value) * 100
+                                # Flag if profit per trade is less than 0.3% of position size (very low)
+                                if profit_as_pct_of_position < 0.3:
+                                    diagnostic_points.append(f"⚠️ **Small Profit per Trade**: Average win of {currency_symbol}{avg_win_per_trade:,.2f} per trade ({profit_as_pct_of_position:.2f}% of position size) is low. Consider wider take profit targets or better entry timing.")
+                                elif profit_as_pct_of_position < 0.5:
+                                    diagnostic_points.append(f"ℹ️ **Moderate Profit per Trade**: Average win of {currency_symbol}{avg_win_per_trade:,.2f} per trade ({profit_as_pct_of_position:.2f}% of position size). Room for improvement with better exits.")
+                            else:
+                                # Fallback: compare to total capital if position size unavailable
+                                if avg_win_per_trade < initial_capital_bt * 0.0005:  # 0.05% instead of 0.1%
+                                    diagnostic_points.append(f"⚠️ **Small Profit per Trade**: Average win of {currency_symbol}{avg_win_per_trade:,.2f} per trade is very small relative to capital.")
+                            
+                            if total_trade_count < 20:
+                                diagnostic_points.append(f"⚠️ **Few Trades**: Only {total_trade_count} closed trades. More trading opportunities needed for higher P&L.")
+                            
+                            if risk_reward_selected >= 5.0:
+                                diagnostic_points.append(f"⚠️ **High Risk:Reward Ratio**: {risk_reward_selected:.1f}:1 ratio means tight stop losses. Profits may be small even when winning.")
+                            
+                            if result.total_pnl_percent < 2.0:
+                                diagnostic_points.append(f"✅ **Low Return Rate**: {result.total_pnl_percent:.2f}% return is low. Strategy may need optimization or more capital deployment.")
+                            
+                            # Add positive feedback if profit per trade is good relative to position size
+                            if avg_position_value > 0:
+                                profit_as_pct_of_position = (avg_win_per_trade / avg_position_value) * 100
+                                if profit_as_pct_of_position >= 1.0:
+                                    diagnostic_points.append(f"✅ **Good Profit per Trade**: Average win of {currency_symbol}{avg_win_per_trade:,.2f} ({profit_as_pct_of_position:.2f}% of position size) is healthy.")
+                            
+                            if diagnostic_points:
+                                for point in diagnostic_points:
+                                    st.markdown(point)
+                            else:
+                                st.info("✅ P&L looks reasonable for the strategy parameters and trade count.")
+                        
+                        # Equity Curve Chart
+                        st.markdown("### 📈 Equity Curve")
+                        import matplotlib.pyplot as plt
+                        fig_bt, axes_bt = plt.subplots(2, 1, figsize=(12, 8))
+                        
+                        # Equity curve
+                        axes_bt[0].plot(result.equity_curve.index, result.equity_curve.values, 
+                                       label="Equity", linewidth=2, color='blue')
+                        axes_bt[0].set_title("Equity Curve")
+                        axes_bt[0].set_ylabel("Equity Value")
+                        axes_bt[0].legend()
+                        axes_bt[0].grid(True, alpha=0.3)
+                        
+                        # Drawdown curve
+                        axes_bt[1].fill_between(result.drawdown_curve.index, 0, 
+                                               result.drawdown_curve.values, 
+                                               alpha=0.3, color="red")
+                        axes_bt[1].plot(result.drawdown_curve.index, result.drawdown_curve.values,
+                                       color="red", linewidth=2)
+                        axes_bt[1].set_title("Drawdown Curve")
+                        axes_bt[1].set_ylabel("Drawdown %")
+                        axes_bt[1].set_xlabel("Date")
+                        axes_bt[1].grid(True, alpha=0.3)
+                        
+                        plt.tight_layout()
+                        st.pyplot(fig_bt)
+                        
+                        # Trade List (if available)
+                        if result.trades and len(result.trades) > 0:
+                            st.markdown("### 📋 Trade History")
+                            trades_df = pd.DataFrame(result.trades)
+                            st.dataframe(trades_df, use_container_width=True, hide_index=True)
+                        
+                    except ImportError as e:
+                        st.warning(f"⚠️ Backtesting modules not available: {str(e)}")
+                        st.info("💡 **Note**: Install required packages: `pip install -r requirements.txt`")
+                    except Exception as e:
+                        st.error(f"Backtest execution error: {str(e)}")
+                        import traceback
+                        with st.expander("Error Details"):
+                            st.code(traceback.format_exc())
+            except Exception as e:
+                st.error(f"Backtest error: {e}")
+                import traceback
+                st.code(traceback.format_exc())
+
 # Enhanced Footer
 st.markdown("---")
-st.markdown("""
+
+# Determine trading mode from environment or config
+trading_mode = os.getenv('TRADING_MODE', 'PAPER').upper()  # PAPER or LIVE
+alpaca_base_url = os.getenv('ALPACA_BASE_URL', 'https://paper-api.alpaca.markets')
+is_paper_trading = 'paper' in alpaca_base_url.lower() or trading_mode == 'PAPER'
+
+if is_paper_trading:
+    disclaimer_text = "⚠️ <strong>Paper Trading Environment</strong> - Strategy testing and validation"
+    disclaimer_subtext = "Using Alpaca paper trading account - No real money at risk"
+    disclaimer_color = "#f59e0b"  # Orange/amber
+else:
+    disclaimer_text = "✅ <strong>Production Trading System</strong> - Live trading enabled"
+    disclaimer_subtext = "Real money trading - Use with caution and proper risk management"
+    disclaimer_color = "#ef4444"  # Red
+
+st.markdown(f"""
 <div style="background: #f8fafc; padding: 2rem; border-radius: 12px; text-align: center; margin-top: 3rem;">
-    <p style="color: #64748b; margin: 0; font-size: 0.875rem;">
-        ⚠️ <strong>Educational / Research Use Only</strong> - Not for actual trading
+    <p style="color: {disclaimer_color}; margin: 0; font-size: 0.875rem; font-weight: 600;">
+        {disclaimer_text}
+    </p>
+    <p style="color: #64748b; margin: 0.5rem 0 0 0; font-size: 0.75rem;">
+        {disclaimer_subtext}
     </p>
     <p style="color: #94a3b8; margin: 0.5rem 0 0 0; font-size: 0.75rem;">
         Nashor Portfolio Quant Trading System v1.0.0 | © 2026
+    </p>
+    <p style="color: #cbd5e1; margin: 0.5rem 0 0 0; font-size: 0.7rem;">
+        Phases 1-4 Integrated: Database ✅ | Auth ✅ | OMS ✅ | EMS ✅ | Backtesting ✅ | API ✅ | Production-Grade ✅
     </p>
 </div>
 """, unsafe_allow_html=True)

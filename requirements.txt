@@ -1,0 +1,9 @@
+
+yfinance
+pandas
+numpy
+matplotlib
+streamlit
+statsmodels
+pyyaml
+alpaca-trade-api

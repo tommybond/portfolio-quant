@@ -1,0 +1,6 @@
+
+market: US
+kill_switch: false
+approval_mode: SEMI
+max_daily_dd: 0.03
+max_total_dd: 0.12

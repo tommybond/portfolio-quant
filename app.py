@@ -4206,8 +4206,45 @@ with tab6:
     st.markdown("**Generate buy/sell recommendations based on technical analysis and position P&L**")
     st.markdown("---")
     
-    # Load existing positions
+    # Load existing positions from multiple sources
     positions = {}
+    
+    # First, try to load from Alpaca broker (like Institutional Deployment tab)
+    broker_positions = {}
+    broker_available = False
+    if INTEGRATIONS_AVAILABLE:
+        try:
+            from oms.broker_alpaca import AlpacaBroker
+            broker_instance = None
+            try:
+                broker_instance = AlpacaBroker()
+                alpaca_positions = broker_instance.api.list_positions()
+                if alpaca_positions:
+                    broker_available = True
+                    for pos in alpaca_positions:
+                        symbol = pos.symbol
+                        qty = int(float(pos.qty))
+                        avg_price = float(pos.avg_entry_price)
+                        current_price = float(pos.current_price)
+                        
+                        # Store broker position
+                        broker_positions[symbol] = {
+                            'net_quantity': qty,
+                            'average_price': avg_price,
+                            'current_price': current_price,
+                            'total_cost': qty * avg_price,
+                            'market_value': float(pos.market_value),
+                            'unrealized_pnl': float(pos.unrealized_pl),
+                            'source': 'Alpaca Broker'
+                        }
+            except Exception as e:
+                # Broker not available or not connected - continue with file-based positions
+                broker_available = False
+        except ImportError:
+            # OMS module not available
+            broker_available = False
+    
+    # Also load from compliance log file (for historical/backup positions)
     compliance_log_file = "compliance_log.json"
     if os.path.exists(compliance_log_file):
         try:
@@ -4238,17 +4275,30 @@ with tab6:
         except:
             pass
     
-    # Calculate net positions
-    net_positions = {}
+    # Calculate net positions from compliance log
+    file_net_positions = {}
     for symbol, data in positions.items():
         net_qty = data['total_bought'] - data['total_sold']
         if net_qty > 0:
             avg_price = data['total_cost'] / data['total_bought'] if data['total_bought'] > 0 else 0
-            net_positions[symbol] = {
+            file_net_positions[symbol] = {
                 'net_quantity': net_qty,
                 'average_price': avg_price,
-                'total_cost': data['total_cost']
+                'total_cost': data['total_cost'],
+                'source': 'Compliance Log'
             }
+    
+    # Merge broker positions with file positions (broker takes priority)
+    net_positions = {}
+    
+    # Add broker positions first (live positions take priority)
+    for symbol, pos_data in broker_positions.items():
+        net_positions[symbol] = pos_data
+    
+    # Add file positions that aren't already in broker positions
+    for symbol, pos_data in file_net_positions.items():
+        if symbol not in net_positions:
+            net_positions[symbol] = pos_data
     
     # Strategy mode selection
     strategy_mode = st.radio(
@@ -4272,6 +4322,11 @@ with tab6:
         
         if input_method == "📋 Load from Positions":
             if net_positions:
+                # Show position source info if broker positions are available
+                if broker_available and broker_positions:
+                    st.success(f"✅ Loaded {len(broker_positions)} position(s) from Alpaca broker" + 
+                              (f" + {len(file_net_positions)} from compliance log" if file_net_positions else ""))
+                
                 selected_position = st.selectbox(
                     "Select Position to Analyze",
                     options=list(net_positions.keys()),
@@ -4279,6 +4334,13 @@ with tab6:
                 )
                 ticker_input = selected_position
                 position_data = net_positions[selected_position]
+                
+                # Show position source
+                position_source = position_data.get('source', 'Unknown')
+                if position_source == 'Alpaca Broker':
+                    st.caption(f"📡 Position loaded from Alpaca broker (Live)")
+                elif position_source == 'Compliance Log':
+                    st.caption(f"📋 Position loaded from compliance log (Historical)")
                 
                 currency_symbol = get_currency_symbol(ticker_input)
                 col_pos_info1, col_pos_info2, col_pos_info3, col_pos_info4 = st.columns(4)
@@ -4290,16 +4352,28 @@ with tab6:
                     st.metric("Total Cost", f"{currency_symbol}{position_data['total_cost']:,.2f}")
                 with col_pos_info4:
                     try:
-                        current_price = yf.Ticker(ticker_input).history(period="1d")["Close"].iloc[-1]
-                        unrealized_pnl = (current_price - position_data['average_price']) * position_data['net_quantity']
-                        unrealized_pnl_pct = ((current_price / position_data['average_price']) - 1) * 100
+                        # Use broker current_price if available, otherwise fetch from yfinance
+                        if 'current_price' in position_data:
+                            current_price = position_data['current_price']
+                            unrealized_pnl = position_data.get('unrealized_pnl', 
+                                (current_price - position_data['average_price']) * position_data['net_quantity'])
+                            unrealized_pnl_pct = ((current_price / position_data['average_price']) - 1) * 100
+                        else:
+                            current_price = yf.Ticker(ticker_input).history(period="1d")["Close"].iloc[-1]
+                            unrealized_pnl = (current_price - position_data['average_price']) * position_data['net_quantity']
+                            unrealized_pnl_pct = ((current_price / position_data['average_price']) - 1) * 100
+                        
                         st.metric("Unrealized P&L", f"{currency_symbol}{unrealized_pnl:,.2f}", 
                                  delta=f"{unrealized_pnl_pct:.2f}%", 
                                  delta_color="normal" if unrealized_pnl >= 0 else "inverse")
                     except:
                         st.metric("Unrealized P&L", "N/A")
             else:
-                st.warning("⚠️ No existing positions found. Use 'Manual Entry' option or execute some BUY trades first.")
+                # More helpful message based on what's available
+                if broker_available:
+                    st.warning("⚠️ No positions found in Alpaca broker account. Connect to Alpaca and execute some BUY trades, or use 'Manual Entry' option.")
+                else:
+                    st.warning("⚠️ No existing positions found. Connect to Alpaca broker or use 'Manual Entry' option to analyze a position.")
                 ticker_input = None
                 position_data = None
         else:
@@ -4338,11 +4412,30 @@ with tab6:
             
             if ticker_input:
                 try:
-                    # Get current price to calculate P&L
-                    stock_temp = yf.Ticker(ticker_input)
-                    hist_temp = stock_temp.history(period="1d")
-                    if not hist_temp.empty:
-                        current_price_temp = hist_temp["Close"].iloc[-1]
+                    # Get current price - prioritize broker price if available
+                    current_price_temp = None
+                    
+                    # Try to get from broker if connected
+                    if INTEGRATIONS_AVAILABLE and broker_available:
+                        try:
+                            from oms.broker_alpaca import AlpacaBroker
+                            broker_instance_temp = AlpacaBroker()
+                            broker_positions_temp = broker_instance_temp.api.list_positions()
+                            for pos in broker_positions_temp:
+                                if pos.symbol == ticker_input:
+                                    current_price_temp = float(pos.current_price)
+                                    break
+                        except:
+                            pass
+                    
+                    # Fallback to yfinance
+                    if current_price_temp is None:
+                        stock_temp = yf.Ticker(ticker_input)
+                        hist_temp = stock_temp.history(period="1d")
+                        if not hist_temp.empty:
+                            current_price_temp = hist_temp["Close"].iloc[-1]
+                        else:
+                            current_price_temp = None
                         total_cost = manual_avg_price * manual_quantity
                         unrealized_pnl_temp = (current_price_temp - manual_avg_price) * manual_quantity
                         unrealized_pnl_pct_temp = ((current_price_temp / manual_avg_price) - 1) * 100
@@ -4391,7 +4484,32 @@ with tab6:
                 if hist.empty:
                     st.error("No data available for this ticker")
                 else:
-                    current_price = hist["Close"].iloc[-1]
+                    # Get current price - prioritize broker price if available, then yfinance
+                    current_price = None
+                    
+                    # First, try to get price from broker position if available
+                    if position_data and 'current_price' in position_data:
+                        current_price = position_data['current_price']
+                        st.caption(f"💰 Using live price from Alpaca broker: ${current_price:.2f}")
+                    else:
+                        # Try to get from broker if connected (even if not in position_data)
+                        if INTEGRATIONS_AVAILABLE and broker_available:
+                            try:
+                                from oms.broker_alpaca import AlpacaBroker
+                                broker_instance_temp = AlpacaBroker()
+                                broker_positions_temp = broker_instance_temp.api.list_positions()
+                                for pos in broker_positions_temp:
+                                    if pos.symbol == ticker_input:
+                                        current_price = float(pos.current_price)
+                                        st.caption(f"💰 Using live price from Alpaca broker: ${current_price:.2f}")
+                                        break
+                            except:
+                                pass
+                    
+                    # Fallback to yfinance (delayed data)
+                    if current_price is None:
+                        current_price = hist["Close"].iloc[-1]
+                        st.caption(f"⚠️ Using delayed price from yfinance: ${current_price:.2f} (15-20 min delay)")
                     
                     # ========== TECHNICAL ANALYSIS ==========
                     st.markdown("---")
@@ -7058,7 +7176,16 @@ if tab_deployment:
             st.markdown("### 💰 Current Market Price")
             current_price = None
             
+            # Clear cached price if ticker changed to force refresh
+            if 'last_ticker_deploy' in st.session_state:
+                if st.session_state.last_ticker_deploy != ticker_deploy:
+                    # Ticker changed, clear cached price to force refresh
+                    if 'deploy_current_price' in st.session_state:
+                        del st.session_state['deploy_current_price']
+            st.session_state.last_ticker_deploy = ticker_deploy
+            
             if ticker_deploy:
+                # Always fetch fresh price from broker (don't use cached session state)
                 if alpaca_connected and broker_instance:
                     # Method 1: Try to get price from existing position (most reliable)
                     try:
@@ -7067,7 +7194,7 @@ if tab_deployment:
                             if pos.symbol == ticker_deploy:
                                 current_price = float(pos.current_price)
                                 st.metric("Current Price", f"${current_price:.2f}")
-                                st.caption("From position")
+                                st.caption("💰 Live price from Alpaca broker (from position)")
                                 break
                     except Exception as e:
                         pass
@@ -7099,7 +7226,7 @@ if tab_deployment:
                                 if bars_df is not None and not bars_df.empty:
                                     current_price = float(bars_df['close'].iloc[-1])
                                     st.metric("Current Price", f"${current_price:.2f}")
-                                    st.caption("Latest 1-minute bar")
+                                    st.caption("💰 Live price from Alpaca broker (1-minute bar)")
                         except Exception as e:
                             pass
                     
@@ -7111,7 +7238,7 @@ if tab_deployment:
                                 if trade:
                                     current_price = float(trade.p) if hasattr(trade, 'p') else float(trade.price)
                                     st.metric("Current Price", f"${current_price:.2f}")
-                                    st.caption("Latest trade")
+                                    st.caption("💰 Live price from Alpaca broker (latest trade)")
                         except Exception as e:
                             pass
                 
@@ -7164,12 +7291,236 @@ if tab_deployment:
                 st.info("💡 Enter ticker symbol to see current price")
                 current_price = None
             
-            # Store current_price in session state so PREPARE button can access it (always execute)
+            # Always store fresh current_price in session state (refresh on every render)
+            # This ensures PREPARE button always uses the latest price
             st.session_state['deploy_current_price'] = current_price
+            
+            # Add timestamp to track when price was fetched
+            if current_price:
+                st.session_state['deploy_current_price_timestamp'] = datetime.now()
         
         # Current Positions Display
         st.markdown("---")
         st.markdown("### 📊 Current Positions")
+        
+        # Helper function to calculate institutional indicators
+        def calculate_trend_strength(symbol):
+            """Calculate trend strength using multiple technical indicators"""
+            try:
+                import yfinance as yf
+                ticker = yf.Ticker(symbol)
+                hist = ticker.history(period='3mo', interval='1d')
+                
+                if hist.empty or len(hist) < 50:
+                    return "N/A"
+                
+                # Calculate moving averages
+                ma20 = hist['Close'].rolling(20).mean().iloc[-1]
+                ma50 = hist['Close'].rolling(50).mean().iloc[-1]
+                current_price = hist['Close'].iloc[-1]
+                
+                # Calculate RSI
+                delta = hist['Close'].diff()
+                gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+                loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+                rs = gain / loss
+                rsi = 100 - (100 / (1 + rs))
+                current_rsi = rsi.iloc[-1] if not pd.isna(rsi.iloc[-1]) else 50
+                
+                # Calculate MACD
+                ema12 = hist['Close'].ewm(span=12, adjust=False).mean()
+                ema26 = hist['Close'].ewm(span=26, adjust=False).mean()
+                macd_line = ema12 - ema26
+                signal_line = macd_line.ewm(span=9, adjust=False).mean()
+                macd_histogram = macd_line - signal_line
+                current_macd = macd_histogram.iloc[-1] if not pd.isna(macd_histogram.iloc[-1]) else 0
+                
+                # Trend strength score (0-100)
+                score = 0
+                
+                # Moving average alignment (40 points)
+                if current_price > ma20 > ma50:
+                    score += 40  # Strong uptrend
+                elif current_price > ma20 and ma20 > ma50:
+                    score += 25  # Moderate uptrend
+                elif current_price < ma20 < ma50:
+                    score += 0   # Downtrend
+                elif current_price < ma20 and ma20 < ma50:
+                    score += 10  # Weak downtrend
+                else:
+                    score += 20  # Neutral
+                
+                # RSI contribution (30 points)
+                if current_rsi > 70:
+                    score += 30  # Overbought but strong
+                elif current_rsi > 60:
+                    score += 25  # Strong momentum
+                elif current_rsi > 50:
+                    score += 15  # Moderate bullish
+                elif current_rsi > 40:
+                    score += 10  # Weak bullish
+                else:
+                    score += 5   # Bearish
+                
+                # MACD contribution (30 points)
+                if current_macd > 0:
+                    score += min(30, abs(current_macd) * 1000)  # Positive momentum
+                else:
+                    score += max(0, 10 + current_macd * 1000)  # Negative momentum
+                
+                # Classify trend strength
+                if score >= 80:
+                    return "Very Strong"
+                elif score >= 65:
+                    return "Strong"
+                elif score >= 50:
+                    return "Moderate"
+                elif score >= 35:
+                    return "Weak"
+                else:
+                    return "Bearish"
+            except Exception as e:
+                return "N/A"
+        
+        def detect_pullback(symbol):
+            """Detect if price is pulling back from recent high"""
+            try:
+                import yfinance as yf
+                ticker = yf.Ticker(symbol)
+                hist = ticker.history(period='3mo', interval='1d')
+                
+                if hist.empty or len(hist) < 20:
+                    return "N/A"
+                
+                current_price = hist['Close'].iloc[-1]
+                
+                # Find recent high (20-day lookback)
+                recent_high = hist['High'].rolling(20).max().iloc[-1]
+                
+                # Calculate pullback percentage
+                pullback_pct = ((recent_high - current_price) / recent_high) * 100
+                
+                # Calculate if price is above/below key moving averages
+                ma20 = hist['Close'].rolling(20).mean().iloc[-1]
+                ma50 = hist['Close'].rolling(50).mean().iloc[-1] if len(hist) >= 50 else ma20
+                
+                # Pullback criteria:
+                # 1. Price is below recent high by at least 2%
+                # 2. Price is still above key moving averages (healthy pullback)
+                # 3. Volume is not spiking (not a breakdown)
+                if pullback_pct >= 2 and current_price > ma20:
+                    # Check if it's a healthy pullback (above MAs) vs breakdown
+                    if current_price > ma50:
+                        return "Yes (Healthy)"
+                    else:
+                        return "Yes (Deep)"
+                elif pullback_pct >= 5:
+                    return "Yes (Deep)"
+                else:
+                    return "No"
+            except Exception as e:
+                return "N/A"
+        
+        def calculate_buy_on_dip(symbol, trend_strength, pullback_status):
+            """Determine if Buy on Dip is enabled based on institutional indicators"""
+            try:
+                # Buy on Dip is enabled when:
+                # 1. Trend strength is Moderate or better
+                # 2. Pullback is detected (healthy pullback preferred)
+                # 3. Not in a bearish trend
+                
+                if trend_strength == "N/A" or pullback_status == "N/A":
+                    return "Disabled"
+                
+                # Disable if trend is bearish
+                if trend_strength == "Bearish":
+                    return "Disabled"
+                
+                # Enable if trend is strong and pullback is healthy
+                if trend_strength in ["Very Strong", "Strong"] and "Yes" in pullback_status:
+                    if "Healthy" in pullback_status:
+                        return "Enabled"
+                    else:
+                        return "Enabled (Caution)"
+                
+                # Enable if trend is moderate and pullback is healthy
+                if trend_strength == "Moderate" and pullback_status == "Yes (Healthy)":
+                    return "Enabled"
+                
+                # Disable otherwise
+                return "Disabled"
+            except Exception as e:
+                return "Disabled"
+        
+        def calculate_stop_loss_levels(symbol, avg_entry_price, current_price):
+            """Calculate institutional stop loss and trailing stop loss levels"""
+            try:
+                import yfinance as yf
+                ticker = yf.Ticker(symbol)
+                hist = ticker.history(period='3mo', interval='1d')
+                
+                if hist.empty or len(hist) < 20:
+                    return None, None, None, None
+                
+                # Calculate ATR (Average True Range) for trailing stop
+                high_low = hist['High'] - hist['Low']
+                high_close = np.abs(hist['High'] - hist['Close'].shift())
+                low_close = np.abs(hist['Low'] - hist['Close'].shift())
+                ranges = pd.concat([high_low, high_close, low_close], axis=1)
+                true_range = ranges.max(axis=1)
+                atr = true_range.rolling(window=14).mean().iloc[-1]
+                
+                # Calculate volatility
+                returns = hist['Close'].pct_change()
+                volatility = returns.std() * np.sqrt(252) * 100  # Annualized %
+                
+                # 1. Fixed Stop Loss (2x ATR below entry or 5% whichever is larger)
+                fixed_stop_pct = max(0.05, (atr * 2 / avg_entry_price))
+                fixed_stop_loss = avg_entry_price * (1 - fixed_stop_pct)
+                
+                # 2. Trailing Stop Loss (2x ATR below current price)
+                trailing_stop_pct = (atr * 2 / current_price)
+                trailing_stop_loss = current_price - (atr * 2)
+                
+                # Ensure trailing stop is not below entry (protect capital)
+                if trailing_stop_loss < avg_entry_price:
+                    trailing_stop_loss = avg_entry_price
+                    trailing_stop_pct = ((current_price - avg_entry_price) / current_price)
+                
+                # Calculate distance from current price to stops
+                distance_to_fixed = ((current_price - fixed_stop_loss) / current_price) * 100
+                distance_to_trailing = ((current_price - trailing_stop_loss) / current_price) * 100
+                
+                return fixed_stop_loss, trailing_stop_loss, distance_to_fixed, distance_to_trailing
+            except Exception as e:
+                return None, None, None, None
+        
+        def get_stop_loss_status(current_price, fixed_stop, trailing_stop, distance_to_fixed, distance_to_trailing):
+            """Determine if stop loss is approaching or near close"""
+            if fixed_stop is None or trailing_stop is None:
+                return "N/A", "N/A"
+            
+            # Fixed Stop Loss Status
+            if distance_to_fixed <= 1.0:
+                fixed_status = "🔴 Near Close (<1%)"
+            elif distance_to_fixed <= 2.0:
+                fixed_status = "🟠 Approaching (<2%)"
+            elif distance_to_fixed <= 3.0:
+                fixed_status = "🟡 Watch (<3%)"
+            else:
+                fixed_status = "🟢 Safe (>3%)"
+            
+            # Trailing Stop Loss Status
+            if distance_to_trailing <= 1.0:
+                trailing_status = "🔴 Near Close (<1%)"
+            elif distance_to_trailing <= 2.0:
+                trailing_status = "🟠 Approaching (<2%)"
+            elif distance_to_trailing <= 3.0:
+                trailing_status = "🟡 Watch (<3%)"
+            else:
+                trailing_status = "🟢 Safe (>3%)"
+            
+            return fixed_status, trailing_status
         
         current_positions = {}
         if alpaca_connected and broker_instance:
@@ -7177,26 +7528,126 @@ if tab_deployment:
                 positions = broker_instance.api.list_positions()
                 if positions:
                     positions_data = []
-                    for pos in positions:
+                    total_positions = len(positions)
+                    
+                    # Show progress if multiple positions
+                    if total_positions > 1:
+                        progress_bar = st.progress(0)
+                    
+                    for idx, pos in enumerate(positions):
+                        symbol = pos.symbol
+                        # Always use fresh price from broker (never cached)
+                        current_price_val = float(pos.current_price)
+                        avg_entry_val = float(pos.avg_entry_price)
+                        
+                        # Update progress
+                        if total_positions > 1:
+                            progress_bar.progress((idx + 1) / total_positions)
+                        
+                        # Calculate institutional indicators
+                        trend_strength = calculate_trend_strength(symbol)
+                        pullback = detect_pullback(symbol)
+                        buy_on_dip = calculate_buy_on_dip(symbol, trend_strength, pullback)
+                        
+                        # Calculate stop loss levels
+                        fixed_stop, trailing_stop, dist_to_fixed, dist_to_trailing = calculate_stop_loss_levels(
+                            symbol, avg_entry_val, current_price_val
+                        )
+                        
+                        # Get stop loss status indicators
+                        fixed_status, trailing_status = get_stop_loss_status(
+                            current_price_val, fixed_stop, trailing_stop, dist_to_fixed, dist_to_trailing
+                        )
+                        
+                        # Format stop loss values
+                        if fixed_stop:
+                            fixed_stop_str = f"${fixed_stop:.2f}"
+                        else:
+                            fixed_stop_str = "N/A"
+                        
+                        if trailing_stop:
+                            trailing_stop_str = f"${trailing_stop:.2f}"
+                        else:
+                            trailing_stop_str = "N/A"
+                        
                         positions_data.append({
-                            'Symbol': pos.symbol,
+                            'Symbol': symbol,
                             'Quantity': int(float(pos.qty)),
-                            'Avg Entry': f"${float(pos.avg_entry_price):.2f}",
-                            'Current Price': f"${float(pos.current_price):.2f}",
+                            'Avg Entry': f"${avg_entry_val:.2f}",
+                            'Current Price': f"${current_price_val:.2f}",
                             'Unrealized P&L': f"${float(pos.unrealized_pl):.2f}",
-                            'Market Value': f"${float(pos.market_value):.2f}"
+                            'Market Value': f"${float(pos.market_value):.2f}",
+                            'Trend Strength': trend_strength,
+                            'Pull Back': pullback,
+                            'Buy on Dip': buy_on_dip,
+                            'Stop Loss': fixed_stop_str,
+                            'Stop Loss Status': fixed_status,
+                            'Trailing Stop': trailing_stop_str,
+                            'Trailing Stop Status': trailing_status
                         })
-                        current_positions[pos.symbol] = {
+                        current_positions[symbol] = {
                             'quantity': int(float(pos.qty)),
-                            'avg_entry': float(pos.avg_entry_price),
-                            'current_price': float(pos.current_price),
-                            'unrealized_pnl': float(pos.unrealized_pl)
+                            'avg_entry': avg_entry_val,
+                            'current_price': current_price_val,  # Always fresh from broker
+                            'unrealized_pnl': float(pos.unrealized_pl),
+                            'trend_strength': trend_strength,
+                            'pullback': pullback,
+                            'buy_on_dip': buy_on_dip,
+                            'fixed_stop_loss': fixed_stop,
+                            'trailing_stop_loss': trailing_stop,
+                            'stop_loss_status': fixed_status,
+                            'trailing_stop_status': trailing_status
                         }
-                    st.dataframe(pd.DataFrame(positions_data), hide_index=True)
+                        
+                        # If this is the ticker being analyzed, update session state with fresh price
+                        if symbol == ticker_deploy:
+                            st.session_state['deploy_current_price'] = current_price_val
+                            st.session_state['deploy_current_price_timestamp'] = datetime.now()
+                    
+                    # Clear progress bar
+                    if total_positions > 1:
+                        progress_bar.empty()
+                    
+                    # Display dataframe with styling
+                    df_positions = pd.DataFrame(positions_data)
+                    st.dataframe(df_positions, hide_index=True)
+                    
+                    # Add explanation
+                    with st.expander("📚 Institutional Indicators Guide"):
+                        st.markdown("""
+                        **Trend Strength:**
+                        - **Very Strong**: Score 80-100 (Strong uptrend, bullish indicators aligned)
+                        - **Strong**: Score 65-79 (Good uptrend, positive momentum)
+                        - **Moderate**: Score 50-64 (Neutral to slightly bullish)
+                        - **Weak**: Score 35-49 (Weak trend, mixed signals)
+                        - **Bearish**: Score <35 (Downtrend, bearish indicators)
+                        
+                        **Pull Back:**
+                        - **Yes (Healthy)**: Price pulled back 2%+ but still above key MAs (good entry opportunity)
+                        - **Yes (Deep)**: Price pulled back 5%+ or below key MAs (caution)
+                        - **No**: Price at or near recent highs (no pullback)
+                        
+                        **Buy on Dip:**
+                        - **Enabled**: Strong/Moderate trend + Healthy pullback (institutional buy opportunity)
+                        - **Enabled (Caution)**: Strong trend but deep pullback (monitor closely)
+                        - **Disabled**: Bearish trend or no pullback (not a good entry)
+                        
+                        **Stop Loss:**
+                        - **Fixed Stop Loss**: 2x ATR below entry price (or 5% minimum) - protects initial capital
+                        - **Trailing Stop Loss**: 2x ATR below current price - locks in profits as price rises
+                        - **Stop Loss Status Indicators:**
+                          - 🔴 **Near Close (<1%)**: Price very close to stop - high risk of being stopped out
+                          - 🟠 **Approaching (<2%)**: Price getting close - monitor closely
+                          - 🟡 **Watch (<3%)**: Price within 3% - be alert
+                          - 🟢 **Safe (>3%)**: Price well above stop - comfortable distance
+                        """)
                 else:
                     st.info("💡 No open positions")
             except Exception as e:
                 st.warning(f"⚠️ Could not fetch positions: {str(e)}")
+                import traceback
+                with st.expander("Error Details"):
+                    st.code(traceback.format_exc())
         else:
             st.info("💡 Connect to Alpaca to see current positions")
         

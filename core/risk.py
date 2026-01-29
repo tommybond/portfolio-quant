@@ -1,6 +1,7 @@
 
 import pandas as pd
 import numpy as np
+from datetime import datetime
 from monitoring.audit import log_event
 from core.portfolio_var_cvar import PortfolioRisk
 from core.stress_testing import StressTester
@@ -45,6 +46,17 @@ class RiskManager:
                 log_event("RISK_LIMIT_ALERT", {"alerts": alerts, "metrics": metrics})
                 if 'VAR LIMIT BREACHED' in alerts:
                     self.kill = True
+                    # Send alert if available
+                    try:
+                        from monitoring.alerts import get_alert_manager
+                        alert_mgr = get_alert_manager()
+                        alert_mgr.send_risk_alert("VAR_LIMIT_BREACHED", {
+                            "var": str(var),
+                            "limit": str(self.max_var),
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+                    except:
+                        pass
                     return "KILL"
         
         return "OK"

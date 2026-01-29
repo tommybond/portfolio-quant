@@ -516,7 +516,7 @@ def load_config():
         return {
             "market": "US",
             "kill_switch": False,
-            "approval_mode": "SEMI",
+            "approval_mode": "AUTO",  # Default to AUTO instead of SEMI
             "max_daily_dd": 0.03,
             "max_total_dd": 0.12
         }
@@ -706,7 +706,7 @@ if "risk_manager" not in st.session_state:
                 max_var=config.get("max_var", -0.05)
             )
         st.session_state.approval = TradeApproval(
-            mode=config.get("approval_mode", "SEMI"),
+            mode=config.get("approval_mode", "AUTO"),
             enable_compliance=config.get("enable_compliance_logging", True)
         )
         st.session_state.config = config
@@ -854,7 +854,7 @@ with st.sidebar:
     approval_mode = st.selectbox(
         "Select approval mode",
         ["AUTO", "SEMI"],
-        index=0 if config.get("approval_mode") == "AUTO" else 1,
+        index=0 if config.get("approval_mode", "AUTO") == "AUTO" else 1,
         label_visibility="collapsed"
     )
     config["approval_mode"] = approval_mode
@@ -993,7 +993,7 @@ with tab1:
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        approval_mode_val = st.session_state.config.get("approval_mode", "SEMI")
+        approval_mode_val = st.session_state.config.get("approval_mode", "AUTO")
         st.markdown("""
         <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 1.5rem; border-radius: 12px; color: white; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
             <div style="font-size: 1.5rem; margin-bottom: 0.5rem;">⚙️</div>
@@ -2258,7 +2258,7 @@ with tab2:
     st.markdown("---")
     
     # Mode indicator
-    approval_mode_display = st.session_state.config.get('approval_mode', 'SEMI')
+    approval_mode_display = st.session_state.config.get('approval_mode', 'AUTO')
     mode_color = "#10b981" if approval_mode_display == "AUTO" else "#f59e0b"
     mode_text = "Automatic approval" if approval_mode_display == "AUTO" else "Manual approval required"
     st.markdown(f"""
@@ -2494,7 +2494,7 @@ with tab2:
                                 side=trade['side'],
                                 qty=trade['quantity'],
                                 price=trade['price'],
-                                reason=f"Approved via {st.session_state.config.get('approval_mode', 'SEMI')} mode"
+                                reason=f"Approved via {st.session_state.config.get('approval_mode', 'AUTO')} mode"
                             )
                             st.session_state.pending_trades.pop(i)
                             st.rerun()
@@ -7570,12 +7570,22 @@ if tab_deployment:
                         else:
                             trailing_stop_str = "N/A"
                         
+                        # Calculate percentage gain for unrealized P&L
+                        unrealized_pnl_val = float(pos.unrealized_pl)
+                        cost_basis = avg_entry_val * int(float(pos.qty))
+                        pnl_percentage = (unrealized_pnl_val / cost_basis * 100) if cost_basis > 0 else 0.0
+                        
+                        # Format P&L with percentage (show + sign for gains, - for losses)
+                        pnl_display = f"${unrealized_pnl_val:+,.2f}"
+                        pnl_pct_display = f"{pnl_percentage:+.2f}%"
+                        
                         positions_data.append({
                             'Symbol': symbol,
                             'Quantity': int(float(pos.qty)),
                             'Avg Entry': f"${avg_entry_val:.2f}",
                             'Current Price': f"${current_price_val:.2f}",
-                            'Unrealized P&L': f"${float(pos.unrealized_pl):.2f}",
+                            'Unrealized P&L': pnl_display,
+                            'P&L %': pnl_pct_display,
                             'Market Value': f"${float(pos.market_value):.2f}",
                             'Trend Strength': trend_strength,
                             'Pull Back': pullback,

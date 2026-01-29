@@ -133,7 +133,31 @@ class MacroRegimeDetector:
         if current_date is not None:
             # Filter data to only include dates up to current_date
             if isinstance(data.index, pd.DatetimeIndex):
-                data = data[data.index <= current_date].copy()
+                # Convert current_date to pandas Timestamp with same timezone as index
+                if isinstance(current_date, datetime):
+                    # Convert Python datetime to pandas Timestamp
+                    current_date_ts = pd.Timestamp(current_date)
+                    # If index has timezone, make current_date timezone-aware
+                    if data.index.tz is not None:
+                        # Convert to same timezone as index
+                        if current_date_ts.tz is None:
+                            # Assume UTC if naive, then convert to index timezone
+                            current_date_ts = current_date_ts.tz_localize('UTC').tz_convert(data.index.tz)
+                        else:
+                            current_date_ts = current_date_ts.tz_convert(data.index.tz)
+                    elif current_date_ts.tz is not None:
+                        # Index is naive but current_date has timezone - remove timezone
+                        current_date_ts = current_date_ts.tz_localize(None)
+                else:
+                    # Already a Timestamp
+                    current_date_ts = pd.Timestamp(current_date)
+                    # Ensure timezone match
+                    if data.index.tz is not None and current_date_ts.tz is None:
+                        current_date_ts = current_date_ts.tz_localize('UTC').tz_convert(data.index.tz)
+                    elif data.index.tz is None and current_date_ts.tz is not None:
+                        current_date_ts = current_date_ts.tz_localize(None)
+                
+                data = data[data.index <= current_date_ts].copy()
         
         if len(data) < 30:
             import warnings

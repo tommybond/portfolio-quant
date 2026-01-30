@@ -20,11 +20,18 @@ import matplotlib
 matplotlib.use('Agg')
 
 from core.risk import RiskManager
-from core.risk_enhanced import EnhancedRiskManager
 from core.approval import TradeApproval
 from monitoring.audit import log_event
 from monitoring.reconciliation import reconcile
 from monitoring.alerts import get_alert_manager, AlertLevel
+
+# Optional enhanced risk manager
+try:
+    from core.risk_enhanced import EnhancedRiskManager
+    ENHANCED_RISK_AVAILABLE = True
+except ImportError:
+    EnhancedRiskManager = None
+    ENHANCED_RISK_AVAILABLE = False
 
 # Phase 1-4 Integrations
 try:
@@ -34,6 +41,12 @@ try:
     from data.realtime_data import get_data_provider
     from oms.oms import OrderManager, Order, OrderType
     from oms.broker_alpaca import AlpacaBroker
+    try:
+        from oms.broker_ibkr import IBKRBroker
+        IBKR_AVAILABLE = True
+    except ImportError:
+        IBKR_AVAILABLE = False
+        IBKRBroker = None
     from ems.ems import ExecutionManager, AlgorithmType
     from ems.algorithms import TWAP, VWAP, ImplementationShortfall
     from backtesting.backtest_engine import BacktestEngine, BacktestConfig
@@ -42,7 +55,40 @@ try:
     INTEGRATIONS_AVAILABLE = True
 except ImportError as e:
     INTEGRATIONS_AVAILABLE = False
+    IBKR_AVAILABLE = False
+    IBKRBroker = None
     st.warning(f"⚠️ Some advanced features not available: {e}")
+
+# Broker helper function
+def get_broker_instance(broker_name: str = None):
+    """
+    Get broker instance based on selection
+    
+    Args:
+        broker_name: Broker name ('Alpaca' or 'IBKR'). If None, uses session state.
+    
+    Returns:
+        Broker instance or None if unavailable
+    """
+    if not INTEGRATIONS_AVAILABLE:
+        return None
+    
+    # Get broker name from parameter or session state
+    if broker_name is None:
+        broker_name = st.session_state.get('selected_broker', 'Alpaca')
+    
+    try:
+        if broker_name == 'Alpaca':
+            return AlpacaBroker()
+        elif broker_name == 'IBKR' and IBKR_AVAILABLE and IBKRBroker:
+            return IBKRBroker()
+        else:
+            # Fallback to Alpaca if IBKR not available
+            return AlpacaBroker()
+    except Exception as e:
+        # Return None if broker initialization fails
+        print(f"Failed to initialize {broker_name} broker: {e}")
+        return None
 
 # Page configuration
 st.set_page_config(
@@ -656,28 +702,67 @@ def save_config(config):
 # Initialize database (if integrations available)
 if INTEGRATIONS_AVAILABLE and "db_initialized" not in st.session_state:
     try:
-        init_database()
-        st.session_state.db_initialized = True
-        
-        # Create default admin user if it doesn't exist
+        # Try to initialize database, fallback to SQLite if PostgreSQL fails
         try:
-            from database.models import User, create_session
-            db = create_session()
-            admin_user = db.query(User).filter(User.username == 'admin').first()
-            if not admin_user:
-                auth_manager = AuthManager(db)
-                admin_user = auth_manager.create_user(
-                    username='admin',
-                    email='admin@nashor.com',
-                    password='admin123',
-                    full_name='System Administrator',
-                    role='admin'
-                )
-                if admin_user:
-                    print("✅ Default admin user created: admin/admin123")
-            db.close()
-        except Exception as e:
-            print(f"Warning: Could not create default admin user: {e}")
+            init_database()
+            st.session_state.db_initialized = True
+            
+            # Create default admin user if it doesn't exist
+            try:
+                from database.models import User, create_session
+                db = create_session()
+                admin_user = db.query(User).filter(User.username == 'admin').first()
+                if not admin_user:
+                    auth_manager = AuthManager(db)
+                    admin_user = auth_manager.create_user(
+                        username='admin',
+                        email='admin@nashor.com',
+                        password='admin123',
+                        full_name='System Administrator',
+                        role='admin'
+                    )
+                    if admin_user:
+                        print("✅ Default admin user created: admin/admin123")
+                db.close()
+            except Exception as e:
+                print(f"Warning: Could not create default admin user: {e}")
+        except Exception as db_error:
+            # If PostgreSQL connection fails, switch to SQLite
+            if 'psycopg2' in str(db_error) or 'Connection refused' in str(db_error) or '5434' in str(db_error):
+                print(f"⚠️ PostgreSQL connection failed, falling back to SQLite: {db_error}")
+                # Temporarily unset DATABASE_URL to force SQLite
+                original_db_url = os.environ.get('DATABASE_URL')
+                if original_db_url:
+                    del os.environ['DATABASE_URL']
+                try:
+                    init_database()
+                    st.session_state.db_initialized = True
+                    # Create admin user with SQLite
+                    try:
+                        from database.models import User, create_session
+                        db = create_session()
+                        admin_user = db.query(User).filter(User.username == 'admin').first()
+                        if not admin_user:
+                            auth_manager = AuthManager(db)
+                            admin_user = auth_manager.create_user(
+                                username='admin',
+                                email='admin@nashor.com',
+                                password='admin123',
+                                full_name='System Administrator',
+                                role='admin'
+                            )
+                            if admin_user:
+                                print("✅ Default admin user created: admin/admin123")
+                        db.close()
+                    except Exception as e:
+                        print(f"Warning: Could not create default admin user: {e}")
+                    # Restore original DATABASE_URL
+                    if original_db_url:
+                        os.environ['DATABASE_URL'] = original_db_url
+                except Exception as sqlite_error:
+                    st.warning(f"Database initialization failed (PostgreSQL and SQLite): {sqlite_error}")
+            else:
+                st.warning(f"Database initialization warning: {db_error}")
     except Exception as e:
         st.warning(f"Database initialization warning: {e}")
 
@@ -690,7 +775,7 @@ if "risk_manager" not in st.session_state:
     try:
         config = load_config()
         # Use enhanced risk manager if available
-        if INTEGRATIONS_AVAILABLE:
+        if INTEGRATIONS_AVAILABLE and ENHANCED_RISK_AVAILABLE and EnhancedRiskManager is not None:
             st.session_state.risk_manager = EnhancedRiskManager(
                 max_daily_dd=config.get("max_daily_dd", 0.03),
                 max_total_dd=config.get("max_total_dd", 0.12),
@@ -747,6 +832,35 @@ if "risk_manager" not in st.session_state:
 # Authentication Check (if integrations available)
 # Skip login page if headless mode is enabled and already authenticated
 headless_mode = os.getenv('HEADLESS_LOGIN', 'false').lower() == 'true'
+
+# If headless mode is enabled, skip login page entirely
+if headless_mode:
+    # Ensure we're authenticated (auto-login was attempted above)
+    if not st.session_state.get("authenticated", False):
+        # Try one more time to authenticate
+        try:
+            if INTEGRATIONS_AVAILABLE:
+                if "auth_manager" not in st.session_state:
+                    st.session_state.auth_manager = AuthManager()
+                auth_manager = st.session_state.auth_manager
+                user = auth_manager.authenticate('admin', 'admin123')
+                if user:
+                    st.session_state.authenticated = True
+                    st.session_state.current_user = user
+                    st.session_state.user_role = user.role
+                    st.session_state.user_id = user.id
+            else:
+                # If integrations not available, set as guest/admin
+                st.session_state.authenticated = True
+                st.session_state.current_user = None
+                st.session_state.user_role = "admin"
+        except Exception:
+            # If auth fails, continue as guest/admin anyway
+            st.session_state.authenticated = True
+            st.session_state.current_user = None
+            st.session_state.user_role = "admin"
+
+# Show login page only if NOT in headless mode AND not authenticated
 if INTEGRATIONS_AVAILABLE and not st.session_state.get("authenticated", False) and not headless_mode:
     # Login page
     st.title("🔐 Login to Nashor Portfolio Quant")
@@ -827,18 +941,78 @@ with st.sidebar:
     # User info
     if INTEGRATIONS_AVAILABLE and st.session_state.get("authenticated"):
         user = st.session_state.current_user
-        st.markdown(f"""
-        <div style="background: #e0f2fe; padding: 0.75rem; border-radius: 8px; margin-bottom: 1rem;">
-            <p style="color: #075985; margin: 0; font-size: 0.875rem;"><strong>User:</strong> {user.username}</p>
-            <p style="color: #0369a1; margin: 0.25rem 0 0 0; font-size: 0.75rem;">Role: {user.role.title()}</p>
-        </div>
-        """, unsafe_allow_html=True)
+        if user and hasattr(user, 'username'):
+            st.markdown(f"""
+            <div style="background: #e0f2fe; padding: 0.75rem; border-radius: 8px; margin-bottom: 1rem;">
+                <p style="color: #075985; margin: 0; font-size: 0.875rem;"><strong>User:</strong> {user.username}</p>
+                <p style="color: #0369a1; margin: 0.25rem 0 0 0; font-size: 0.75rem;">Role: {user.role.title() if hasattr(user, 'role') else 'admin'}</p>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            # Fallback if user object is None (headless mode)
+            username = st.session_state.get("user_role", "admin")
+            st.markdown(f"""
+            <div style="background: #e0f2fe; padding: 0.75rem; border-radius: 8px; margin-bottom: 1rem;">
+                <p style="color: #075985; margin: 0; font-size: 0.875rem;"><strong>User:</strong> admin</p>
+                <p style="color: #0369a1; margin: 0.25rem 0 0 0; font-size: 0.75rem;">Role: {username.title()}</p>
+            </div>
+            """, unsafe_allow_html=True)
         
         if st.button("🚪 Logout", use_container_width=True):
             st.session_state.authenticated = False
             st.session_state.current_user = None
             st.session_state.user_role = "guest"
             st.rerun()
+    
+    # Broker Selection
+    st.markdown("### 🏦 Broker Selection")
+    st.markdown("---")
+    
+    # Initialize broker selection in session state
+    if 'selected_broker' not in st.session_state:
+        st.session_state.selected_broker = 'Alpaca'
+    
+    # Available brokers
+    available_brokers = ['Alpaca']
+    if IBKR_AVAILABLE and IBKRBroker:
+        available_brokers.append('IBKR')
+    
+    # Broker selection dropdown
+    selected_broker = st.selectbox(
+        "Select Broker",
+        available_brokers,
+        index=0 if st.session_state.selected_broker == 'Alpaca' else (1 if 'IBKR' in available_brokers else 0),
+        help="Choose which broker to use for trading",
+        key="broker_selectbox"
+    )
+    st.session_state.selected_broker = selected_broker
+    
+    # Show broker status
+    broker_status_col1, broker_status_col2 = st.columns([2, 1])
+    with broker_status_col1:
+        try:
+            broker_instance = get_broker_instance(selected_broker)
+            if broker_instance:
+                if selected_broker == 'Alpaca':
+                    try:
+                        account = broker_instance.api.get_account()
+                        st.success(f"✅ {selected_broker} Connected")
+                        st.caption(f"Status: {account.status}")
+                    except:
+                        st.warning(f"⚠️ {selected_broker} Not Connected")
+                elif selected_broker == 'IBKR':
+                    if hasattr(broker_instance, 'ib') and broker_instance.ib.isConnected():
+                        st.success(f"✅ {selected_broker} Connected")
+                        st.caption(f"TWS/Gateway: {broker_instance.host}:{broker_instance.port}")
+                    else:
+                        st.warning(f"⚠️ {selected_broker} Not Connected")
+                        st.caption("Start TWS/IB Gateway")
+            else:
+                st.error(f"❌ {selected_broker} Unavailable")
+        except Exception as e:
+            st.error(f"❌ {selected_broker} Error: {str(e)[:30]}")
+    
+    st.markdown("---")
     
     st.markdown("### ⚙️ System Configuration")
     st.markdown("---")
@@ -2353,7 +2527,9 @@ with tab2:
                 }
                 
                 # Pre-trade risk checks (if enhanced risk manager available)
-                if INTEGRATIONS_AVAILABLE and isinstance(st.session_state.risk_manager, EnhancedRiskManager):
+                if (INTEGRATIONS_AVAILABLE and ENHANCED_RISK_AVAILABLE and 
+                    EnhancedRiskManager is not None and 
+                    isinstance(st.session_state.risk_manager, EnhancedRiskManager)):
                     user_id = st.session_state.get("user_id", 1)
                     portfolio_value = 1000000  # TODO: Get actual portfolio value
                     total_exposure = portfolio_value * 1.2  # TODO: Calculate actual exposure
@@ -2377,12 +2553,8 @@ with tab2:
                 # Use OMS if available
                 if INTEGRATIONS_AVAILABLE:
                     try:
-                        # Initialize broker and OMS
-                        broker = None
-                        try:
-                            broker = AlpacaBroker()
-                        except:
-                            pass  # Use simulation mode
+                        # Initialize broker and OMS using selected broker
+                        broker = get_broker_instance()
                         
                         oms = OrderManager(broker=broker)
                         
@@ -2460,11 +2632,8 @@ with tab2:
                             # Use OMS if available
                             if INTEGRATIONS_AVAILABLE:
                                 try:
-                                    broker = None
-                                    try:
-                                        broker = AlpacaBroker()
-                                    except:
-                                        pass
+                                    # Use selected broker
+                                    broker = get_broker_instance()
                                     
                                     oms = OrderManager(broker=broker)
                                     order = Order(
@@ -4209,40 +4378,60 @@ with tab6:
     # Load existing positions from multiple sources
     positions = {}
     
-    # First, try to load from Alpaca broker (like Institutional Deployment tab)
+    # First, try to load from selected broker
     broker_positions = {}
     broker_available = False
     if INTEGRATIONS_AVAILABLE:
         try:
-            from oms.broker_alpaca import AlpacaBroker
-            broker_instance = None
-            try:
-                broker_instance = AlpacaBroker()
-                alpaca_positions = broker_instance.api.list_positions()
-                if alpaca_positions:
-                    broker_available = True
-                    for pos in alpaca_positions:
-                        symbol = pos.symbol
-                        qty = int(float(pos.qty))
-                        avg_price = float(pos.avg_entry_price)
-                        current_price = float(pos.current_price)
-                        
-                        # Store broker position
-                        broker_positions[symbol] = {
-                            'net_quantity': qty,
-                            'average_price': avg_price,
-                            'current_price': current_price,
-                            'total_cost': qty * avg_price,
-                            'market_value': float(pos.market_value),
-                            'unrealized_pnl': float(pos.unrealized_pl),
-                            'source': 'Alpaca Broker'
-                        }
-            except Exception as e:
-                # Broker not available or not connected - continue with file-based positions
-                broker_available = False
-        except ImportError:
+            broker_instance = get_broker_instance()
+            if broker_instance:
+                try:
+                    selected_broker_name = st.session_state.get('selected_broker', 'Alpaca')
+                    
+                    if selected_broker_name == 'Alpaca':
+                        # Alpaca broker
+                        positions_list = broker_instance.api.list_positions()
+                        if positions_list:
+                            broker_available = True
+                            for pos in positions_list:
+                                symbol = pos.symbol
+                                qty = int(float(pos.qty))
+                                avg_price = float(pos.avg_entry_price)
+                                current_price = float(pos.current_price)
+                                
+                                broker_positions[symbol] = {
+                                    'net_quantity': qty,
+                                    'average_price': avg_price,
+                                    'current_price': current_price,
+                                    'total_cost': qty * avg_price,
+                                    'market_value': float(pos.market_value),
+                                    'unrealized_pnl': float(pos.unrealized_pl),
+                                    'source': 'Alpaca Broker'
+                                }
+                    elif selected_broker_name == 'IBKR':
+                        # IBKR broker
+                        positions_list = broker_instance.get_positions()
+                        if positions_list:
+                            broker_available = True
+                            for pos in positions_list:
+                                symbol = pos['symbol']
+                                broker_positions[symbol] = {
+                                    'net_quantity': pos['quantity'],
+                                    'average_price': pos['average_price'],
+                                    'current_price': pos['current_price'],
+                                    'total_cost': abs(pos['quantity']) * pos['average_price'],
+                                    'market_value': pos['market_value'],
+                                    'unrealized_pnl': pos['unrealized_pnl'],
+                                    'source': 'IBKR Broker'
+                                }
+                except Exception as e:
+                    # Broker not available or not connected - continue with file-based positions
+                    broker_available = False
+                    print(f"Broker connection error: {e}")
+        except Exception as e:
             # OMS module not available
             broker_available = False
+            print(f"Broker initialization error: {e}")
     
     # Also load from compliance log file (for historical/backup positions)
     compliance_log_file = "compliance_log.json"
@@ -4418,9 +4607,24 @@ with tab6:
                     # Try to get from broker if connected
                     if INTEGRATIONS_AVAILABLE and broker_available:
                         try:
-                            from oms.broker_alpaca import AlpacaBroker
-                            broker_instance_temp = AlpacaBroker()
-                            broker_positions_temp = broker_instance_temp.api.list_positions()
+                            broker_instance_temp = get_broker_instance()
+                            selected_broker_temp = st.session_state.get('selected_broker', 'Alpaca')
+                            
+                            if selected_broker_temp == 'Alpaca' and broker_instance_temp:
+                                broker_positions_temp = broker_instance_temp.api.list_positions()
+                            elif selected_broker_temp == 'IBKR' and broker_instance_temp:
+                                broker_positions_temp = broker_instance_temp.get_positions()
+                                # Convert IBKR format to Alpaca-like format for compatibility
+                                broker_positions_temp = [
+                                    type('obj', (object,), {
+                                        'symbol': p['symbol'],
+                                        'qty': str(p['quantity']),
+                                        'avg_entry_price': str(p['average_price']),
+                                        'current_price': str(p['current_price'])
+                                    })() for p in broker_positions_temp
+                                ]
+                            else:
+                                broker_positions_temp = []
                             for pos in broker_positions_temp:
                                 if pos.symbol == ticker_input:
                                     current_price_temp = float(pos.current_price)
@@ -4495,9 +4699,24 @@ with tab6:
                         # Try to get from broker if connected (even if not in position_data)
                         if INTEGRATIONS_AVAILABLE and broker_available:
                             try:
-                                from oms.broker_alpaca import AlpacaBroker
-                                broker_instance_temp = AlpacaBroker()
-                                broker_positions_temp = broker_instance_temp.api.list_positions()
+                                broker_instance_temp = get_broker_instance()
+                                selected_broker_temp = st.session_state.get('selected_broker', 'Alpaca')
+                                
+                                if selected_broker_temp == 'Alpaca' and broker_instance_temp:
+                                    broker_positions_temp = broker_instance_temp.api.list_positions()
+                                elif selected_broker_temp == 'IBKR' and broker_instance_temp:
+                                    broker_positions_temp = broker_instance_temp.get_positions()
+                                    # Convert IBKR format to Alpaca-like format for compatibility
+                                    broker_positions_temp = [
+                                        type('obj', (object,), {
+                                            'symbol': p['symbol'],
+                                            'qty': str(p['quantity']),
+                                            'avg_entry_price': str(p['average_price']),
+                                            'current_price': str(p['current_price'])
+                                        })() for p in broker_positions_temp
+                                    ]
+                                else:
+                                    broker_positions_temp = []
                                 for pos in broker_positions_temp:
                                     if pos.symbol == ticker_input:
                                         current_price = float(pos.current_price)
@@ -6975,27 +7194,44 @@ if tab_deployment:
                       "Please ensure all required packages are installed: `pip install -r requirements.txt`")
             st.stop()
         
-        # Check Alpaca connection
-        alpaca_connected = False
+        # Check broker connection (using selected broker)
+        broker_connected = False
         broker_instance = None
         account_status = None
         buying_power = 0.0
+        selected_broker_deploy = st.session_state.get('selected_broker', 'Alpaca')
         
         try:
-            if AlpacaBroker:
-                broker_instance = AlpacaBroker()
-                # Test connection by getting account
-                account = broker_instance.api.get_account()
-                alpaca_connected = True
+            broker_instance = get_broker_instance(selected_broker_deploy)
+            if broker_instance:
+                if selected_broker_deploy == 'Alpaca':
+                    # Test Alpaca connection
+                    account = broker_instance.api.get_account()
+                    broker_connected = True
+                    account_status = account.status
+                    buying_power = float(account.buying_power)
+                elif selected_broker_deploy == 'IBKR':
+                    # Test IBKR connection
+                    if hasattr(broker_instance, 'ib') and broker_instance.ib.isConnected():
+                        broker_connected = True
+                        account_info = broker_instance.get_account_info()
+                        account_status = 'ACTIVE' if account_info else 'UNKNOWN'
+                        buying_power = account_info.get('buying_power', 0.0)
                 account_status = account.status
                 buying_power = float(account.buying_power)
         except Exception as e:
-            alpaca_connected = False
-            st.warning(f"⚠️ **Alpaca Connection**: {str(e)}")
-            st.info("💡 **Note**: Ensure ALPACA_API_KEY and ALPACA_SECRET_KEY are set in environment variables")
+            broker_connected = False
+            broker_name_display = selected_broker_deploy
+            if selected_broker_deploy == 'Alpaca':
+                st.warning(f"⚠️ **{broker_name_display} Connection**: {str(e)}")
+                st.info("💡 **Note**: Ensure ALPACA_API_KEY and ALPACA_SECRET_KEY are set in environment variables")
+            elif selected_broker_deploy == 'IBKR':
+                st.warning(f"⚠️ **{broker_name_display} Connection**: {str(e)}")
+                st.info("💡 **Note**: Ensure TWS or IB Gateway is running and API connections are enabled")
         
-        if alpaca_connected:
-            st.success(f"✅ **Alpaca Connected** - Account Status: {account_status.upper()} | Buying Power: ${buying_power:,.2f}")
+        if broker_connected:
+            broker_name_display = selected_broker_deploy
+            st.success(f"✅ **{broker_name_display} Connected** - Account Status: {account_status.upper()} | Buying Power: ${buying_power:,.2f}")
         
         col_deploy1, col_deploy2 = st.columns([2, 1])
         
@@ -7186,59 +7422,82 @@ if tab_deployment:
             
             if ticker_deploy:
                 # Always fetch fresh price from broker (don't use cached session state)
-                if alpaca_connected and broker_instance:
+                if broker_connected and broker_instance:
                     # Method 1: Try to get price from existing position (most reliable)
                     try:
-                        positions = broker_instance.api.list_positions()
-                        for pos in positions:
-                            if pos.symbol == ticker_deploy:
-                                current_price = float(pos.current_price)
-                                st.metric("Current Price", f"${current_price:.2f}")
-                                st.caption("💰 Live price from Alpaca broker (from position)")
-                                break
+                        if selected_broker_deploy == 'Alpaca':
+                            positions = broker_instance.api.list_positions()
+                            for pos in positions:
+                                if pos.symbol == ticker_deploy:
+                                    current_price = float(pos.current_price)
+                                    st.metric("Current Price", f"${current_price:.2f}")
+                                    st.caption(f"💰 Live price from {selected_broker_deploy} broker (from position)")
+                                    break
+                        elif selected_broker_deploy == 'IBKR':
+                            positions = broker_instance.get_positions()
+                            for pos in positions:
+                                if pos['symbol'] == ticker_deploy:
+                                    current_price = pos['current_price']
+                                    st.metric("Current Price", f"${current_price:.2f}")
+                                    st.caption(f"💰 Live price from {selected_broker_deploy} broker (from position)")
+                                    break
                     except Exception as e:
                         pass
                     
-                    # Method 2: Try Alpaca get_bars (if available)
+                    # Method 2: Try broker-specific price fetching
                     if current_price is None:
                         try:
-                            if hasattr(broker_instance.api, 'get_bars'):
-                                bars = broker_instance.api.get_bars(
-                                    ticker_deploy,
-                                    "1Min",
-                                    limit=1
-                                )
-                                # Handle both DataFrame and list responses
-                                if hasattr(bars, 'df'):
-                                    bars_df = bars.df
-                                elif isinstance(bars, list) and len(bars) > 0:
-                                    import pandas as pd
-                                    bars_df = pd.DataFrame([{
-                                        'close': bars[0].c,
-                                        'open': bars[0].o,
-                                        'high': bars[0].h,
-                                        'low': bars[0].l,
-                                        'volume': bars[0].v
-                                    }])
-                                else:
-                                    bars_df = None
-                                
-                                if bars_df is not None and not bars_df.empty:
-                                    current_price = float(bars_df['close'].iloc[-1])
-                                    st.metric("Current Price", f"${current_price:.2f}")
-                                    st.caption("💰 Live price from Alpaca broker (1-minute bar)")
+                            if selected_broker_deploy == 'Alpaca':
+                                # Try Alpaca get_bars (if available)
+                                if hasattr(broker_instance.api, 'get_bars'):
+                                    bars = broker_instance.api.get_bars(
+                                        ticker_deploy,
+                                        "1Min",
+                                        limit=1
+                                    )
+                                    # Handle both DataFrame and list responses
+                                    if hasattr(bars, 'df'):
+                                        bars_df = bars.df
+                                    elif isinstance(bars, list) and len(bars) > 0:
+                                        import pandas as pd
+                                        bars_df = pd.DataFrame([{
+                                            'close': bars[0].c,
+                                            'open': bars[0].o,
+                                            'high': bars[0].h,
+                                            'low': bars[0].l,
+                                            'volume': bars[0].v
+                                        }])
+                                    else:
+                                        bars_df = None
+                                    
+                                    if bars_df is not None and not bars_df.empty:
+                                        current_price = float(bars_df['close'].iloc[-1])
+                                        st.metric("Current Price", f"${current_price:.2f}")
+                                        st.caption(f"💰 Live price from {selected_broker_deploy} broker (1-minute bar)")
+                            elif selected_broker_deploy == 'IBKR':
+                                # Try IBKR market data
+                                from ib_insync import Stock
+                                contract = Stock(ticker_deploy, 'SMART', 'USD')
+                                qualified = broker_instance.ib.qualifyContracts(contract)
+                                if qualified:
+                                    ticker = broker_instance.ib.reqMktData(qualified[0], '', False, False)
+                                    broker_instance.ib.sleep(1)  # Wait for market data
+                                    if ticker.marketPrice():
+                                        current_price = ticker.marketPrice()
+                                        st.metric("Current Price", f"${current_price:.2f}")
+                                        st.caption(f"💰 Live price from {selected_broker_deploy} broker")
                         except Exception as e:
                             pass
                     
-                    # Method 3: Try Alpaca get_latest_trade (if available)
-                    if current_price is None:
+                    # Method 3: Try Alpaca get_latest_trade (Alpaca only)
+                    if current_price is None and selected_broker_deploy == 'Alpaca':
                         try:
                             if hasattr(broker_instance.api, 'get_latest_trade'):
                                 trade = broker_instance.api.get_latest_trade(ticker_deploy)
                                 if trade:
                                     current_price = float(trade.p) if hasattr(trade, 'p') else float(trade.price)
                                     st.metric("Current Price", f"${current_price:.2f}")
-                                    st.caption("💰 Live price from Alpaca broker (latest trade)")
+                                    st.caption(f"💰 Live price from {selected_broker_deploy} broker (latest trade)")
                         except Exception as e:
                             pass
                 
@@ -7523,9 +7782,26 @@ if tab_deployment:
             return fixed_status, trailing_status
         
         current_positions = {}
-        if alpaca_connected and broker_instance:
+        if broker_connected and broker_instance:
             try:
-                positions = broker_instance.api.list_positions()
+                if selected_broker_deploy == 'Alpaca':
+                    positions = broker_instance.api.list_positions()
+                elif selected_broker_deploy == 'IBKR':
+                    positions_raw = broker_instance.get_positions()
+                    # Convert IBKR format to Alpaca-like format
+                    positions = [
+                        type('obj', (object,), {
+                            'symbol': p['symbol'],
+                            'qty': str(p['quantity']),
+                            'avg_entry_price': str(p['average_price']),
+                            'current_price': str(p['current_price']),
+                            'market_value': str(p['market_value']),
+                            'unrealized_pl': str(p['unrealized_pnl'])
+                        })() for p in positions_raw
+                    ]
+                else:
+                    positions = []
+                
                 if positions:
                     positions_data = []
                     total_positions = len(positions)
@@ -7675,7 +7951,7 @@ if tab_deployment:
             # Get current_price from session state (set in price display section above)
             deploy_current_price = st.session_state.get('deploy_current_price', None)
             
-            # Enable PREPARE button if we have ticker and price (price can come from yfinance even if Alpaca not connected)
+            # Enable PREPARE button if we have ticker and price (price can come from yfinance even if broker not connected)
             prepare_disabled = not ticker_deploy or deploy_current_price is None
             
             if st.button("🔍 PREPARE", type="primary", use_container_width=True,
@@ -7733,7 +8009,7 @@ if tab_deployment:
                                     )
                                     
                                     # Calculate total position size
-                                    portfolio_value = buying_power if alpaca_connected else 100000.0
+                                    portfolio_value = buying_power if broker_connected else 100000.0
                                     total_quantity, breakdown = position_sizer.calculate_position_size(
                                         portfolio_value=portfolio_value,
                                         price=deploy_current_price,
@@ -7789,7 +8065,7 @@ if tab_deployment:
                                     
                                 else:
                                     # Fallback: Standard trench sizing - use max cap
-                                    portfolio_value = buying_power if alpaca_connected else 100000.0
+                                    portfolio_value = buying_power if broker_connected else 100000.0
                                     position_pct = macro_max_pct_deploy if use_macro_regime_deploy else 0.15
                                     total_quantity = int((portfolio_value * position_pct) / deploy_current_price)
                                     trench_levels = 3
@@ -7909,7 +8185,7 @@ if tab_deployment:
             
             # Execute button
             with col_execute:
-                execute_disabled = not alpaca_connected or len(st.session_state.prepared_orders) == 0
+                execute_disabled = not broker_connected or len(st.session_state.prepared_orders) == 0
                 
                 if st.session_state.prepared_action == "BUY":
                     button_color = "primary"
@@ -8075,7 +8351,7 @@ if tab_deployment:
         
         with col_quick1:
             if st.button("🟢 QUICK BUY", type="primary", use_container_width=True, 
-                        disabled=not alpaca_connected or not current_price):
+                        disabled=not broker_connected or not current_price):
                 if ticker_deploy and current_price:
                     try:
                         # Calculate position size using macro regime if enabled
@@ -8102,7 +8378,7 @@ if tab_deployment:
                                     )
                                     
                                     # Calculate position size
-                                    portfolio_value = buying_power if alpaca_connected else 100000.0
+                                    portfolio_value = buying_power if broker_connected else 100000.0
                                     quantity, breakdown = position_sizer.calculate_position_size(
                                         portfolio_value=portfolio_value,
                                         price=current_price,
@@ -8131,7 +8407,7 @@ if tab_deployment:
                                         })
                                 else:
                                     # Fallback to standard sizing
-                                    portfolio_value = buying_power if alpaca_connected else 100000.0
+                                    portfolio_value = buying_power if broker_connected else 100000.0
                                     position_pct = macro_max_pct_deploy if use_macro_regime_deploy else 0.10
                                     quantity = int((portfolio_value * position_pct) / current_price)
                                     st.info(f"⚠️ Using standard sizing: {quantity} shares ({position_pct*100:.1f}% of portfolio)")
@@ -8198,7 +8474,7 @@ if tab_deployment:
         
         with col_quick2:
             if st.button("🔴 QUICK SELL", type="secondary", use_container_width=True,
-                        disabled=not alpaca_connected or not current_price):
+                        disabled=not broker_connected or not current_price):
                 if ticker_deploy and current_price:
                     try:
                         # Get current position

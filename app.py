@@ -7475,17 +7475,35 @@ if tab_deployment:
                                         st.metric("Current Price", f"${current_price:.2f}")
                                         st.caption(f"💰 Live price from {selected_broker_deploy} broker (1-minute bar)")
                             elif selected_broker_deploy == 'IBKR':
-                                # Try IBKR market data
-                                from ib_insync import Stock
-                                contract = Stock(ticker_deploy, 'SMART', 'USD')
-                                qualified = broker_instance.ib.qualifyContracts(contract)
-                                if qualified:
-                                    ticker = broker_instance.ib.reqMktData(qualified[0], '', False, False)
-                                    broker_instance.ib.sleep(1)  # Wait for market data
-                                    if ticker.marketPrice():
-                                        current_price = ticker.marketPrice()
-                                        st.metric("Current Price", f"${current_price:.2f}")
-                                        st.caption(f"💰 Live price from {selected_broker_deploy} broker")
+                                # Try IBKR market data - use broker's internal method
+                                try:
+                                    # Get positions to extract price (broker handles event loop)
+                                    positions = broker_instance.get_positions()
+                                    for pos in positions:
+                                        if pos['symbol'] == ticker_deploy:
+                                            current_price = pos['current_price']
+                                            if current_price and current_price > 0:
+                                                st.metric("Current Price", f"${current_price:.2f}")
+                                                st.caption(f"💰 Live price from {selected_broker_deploy} broker")
+                                                break
+                                except Exception as e:
+                                    # Fallback: try direct call with error handling
+                                    try:
+                                        from ib_insync import Stock
+                                        contract = Stock(ticker_deploy, 'SMART', 'USD')
+                                        # Ensure event loop exists before calling
+                                        if hasattr(broker_instance, '_ensure_event_loop'):
+                                            broker_instance._ensure_event_loop()
+                                        qualified = broker_instance.ib.qualifyContracts(contract)
+                                        if qualified:
+                                            ticker = broker_instance.ib.reqMktData(qualified[0], '', False, False)
+                                            broker_instance.ib.sleep(1)  # Wait for market data
+                                            if ticker.marketPrice():
+                                                current_price = ticker.marketPrice()
+                                                st.metric("Current Price", f"${current_price:.2f}")
+                                                st.caption(f"💰 Live price from {selected_broker_deploy} broker")
+                                    except Exception as e2:
+                                        pass  # Will fall back to yfinance
                         except Exception as e:
                             pass
                     

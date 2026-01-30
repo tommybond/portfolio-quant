@@ -41,6 +41,9 @@ Thumbs.db
 *.log
 audit.log
 
+# Database
+portfolio_quant.db
+
 # Environment variables
 .env
 .env.local

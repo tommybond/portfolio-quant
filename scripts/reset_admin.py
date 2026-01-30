@@ -44,7 +44,8 @@ def reset_admin_password(new_password='admin123'):
         
         # Reset password
         print(f"\n3. Resetting password...")
-        admin.password_hash = auth.hash_password(new_password)
+        from auth.auth import _hash_password
+        admin.password_hash = _hash_password(new_password)
         admin.is_active = True
         db.commit()
         print(f"   ✅ Password reset successful")

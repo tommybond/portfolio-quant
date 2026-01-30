@@ -77,7 +77,7 @@ except ImportError as e:
 # Broker helper function
 def get_broker_instance(broker_name: str = None):
     """
-    Get broker instance based on selection - cached in session state
+    Get broker instance based on selection
     """
     if not INTEGRATIONS_AVAILABLE:
         return None
@@ -85,47 +85,23 @@ def get_broker_instance(broker_name: str = None):
     if broker_name is None:
         broker_name = st.session_state.get('selected_broker', 'Alpaca')
 
-    # Cache key for this broker
-    cache_key = f'broker_instance_{broker_name}'
-    
-    # Return cached instance if available and still connected
-    if cache_key in st.session_state:
-        broker = st.session_state[cache_key]
-        if broker is not None:
-            # Check if still connected
-            if broker_name == 'IBKR' and hasattr(broker, 'ib'):
-                if broker.ib.isConnected():
-                    return broker
-                # If disconnected, remove from cache and recreate below
-                del st.session_state[cache_key]
-            else:
-                return broker
-
     try:
         if broker_name == 'Alpaca':
-            broker = AlpacaBroker()
+            return AlpacaBroker()
         elif broker_name == "IBKR" and IBKR_AVAILABLE and IBKRBroker:
             client_id = st.session_state["ibkr_client_id"]
             broker = IBKRBroker(client_id=client_id, auto_connect=False)
             # Try to connect
             try:
                 broker.connect(timeout=3.0)
-                if broker.ib.isConnected():
-                    print(f"✅ IBKR connected successfully (client_id={client_id})")
-                else:
-                    print(f"⚠️ IBKR connection returned but not connected (client_id={client_id})")
             except Exception as conn_error:
-                print(f"❌ IBKR connection error: {conn_error}")
+                print(f"IBKR connection error: {conn_error}")
                 # Store error in session state for debugging
                 st.session_state['ibkr_last_error'] = str(conn_error)
                 # Return broker instance anyway (will show as not connected)
+            return broker
         else:
-            broker = AlpacaBroker()
-        
-        # Cache the broker instance
-        st.session_state[cache_key] = broker
-        return broker
-        
+            return AlpacaBroker()
     except Exception as e:
         print(f"Failed to initialize {broker_name} broker: {e}")
         return None
@@ -2381,10 +2357,7 @@ with tab2:
                     stock = yf.Ticker(symbol)
                     hist = stock.history(period="1d")
                     if not hist.empty:
-                        price_val = hist["Close"].iloc[-1]
-                        # Check for NaN
-                        if pd.notna(price_val) and not np.isnan(price_val):
-                            current_price = float(price_val)
+                        current_price = hist["Close"].iloc[-1]
                 except:
                     pass
                 
@@ -2492,28 +2465,12 @@ with tab2:
                             data_provider = get_data_provider('auto')
                             current_price = data_provider.get_live_price(selected_symbol)
                             if current_price is None:
-                                hist = yf.Ticker(selected_symbol).history(period='1d')
-                                if not hist.empty:
-                                    price_val = hist['Close'].iloc[-1]
-                                    if pd.notna(price_val) and not np.isnan(price_val):
-                                        current_price = float(price_val)
+                                current_price = yf.Ticker(selected_symbol).history(period='1d')['Close'].iloc[-1]
                         except:
-                            hist = yf.Ticker(selected_symbol).history(period='1d')
-                            if not hist.empty:
-                                price_val = hist['Close'].iloc[-1]
-                                if pd.notna(price_val) and not np.isnan(price_val):
-                                    current_price = float(price_val)
+                            current_price = yf.Ticker(selected_symbol).history(period='1d')['Close'].iloc[-1]
                     else:
-                        hist = yf.Ticker(selected_symbol).history(period='1d')
-                        if not hist.empty:
-                            price_val = hist['Close'].iloc[-1]
-                            if pd.notna(price_val) and not np.isnan(price_val):
-                                current_price = float(price_val)
-                    
-                    if current_price and pd.notna(current_price):
-                        current_value = pos['net_quantity'] * current_price
-                    else:
-                        current_value = pos['net_quantity'] * pos['average_price']
+                        current_price = yf.Ticker(selected_symbol).history(period='1d')['Close'].iloc[-1]
+                    current_value = pos['net_quantity'] * current_price
                 except:
                     current_value = pos['net_quantity'] * pos['average_price']
                 st.metric("Current Value", f"{currency_symbol}{current_value:,.2f}")
@@ -7297,113 +7254,42 @@ if tab_deployment:
                       "Please ensure all required packages are installed: `pip install -r requirements.txt`")
             st.stop()
         
-        # Check broker connection (using selected broker) - cache in session state
+        # Check broker connection (using selected broker)
+        broker_connected = False
+        broker_instance = None
+        account_status = None
+        buying_power = 0.0
         selected_broker_deploy = st.session_state.get('selected_broker', 'Alpaca')
-        broker_cache_key = f'deploy_broker_connected_{selected_broker_deploy}'
         
-        # Initialize or retrieve cached connection status
-        if broker_cache_key not in st.session_state:
-            st.session_state[broker_cache_key] = False
-            st.session_state[f'deploy_broker_instance_{selected_broker_deploy}'] = None
-            st.session_state[f'deploy_buying_power_{selected_broker_deploy}'] = 0.0
-            st.session_state[f'deploy_account_status_{selected_broker_deploy}'] = None
-        
-        broker_connected = st.session_state[broker_cache_key]
-        broker_instance = st.session_state[f'deploy_broker_instance_{selected_broker_deploy}']
-        buying_power = st.session_state[f'deploy_buying_power_{selected_broker_deploy}']
-        account_status = st.session_state[f'deploy_account_status_{selected_broker_deploy}']
-        
-        # Only check connection if not already connected or if explicitly reconnecting
-        if not broker_connected or broker_instance is None:
-            with st.spinner(f"🔌 Connecting to {selected_broker_deploy}..."):
-                try:
-                    print(f"🔌 Attempting to connect to {selected_broker_deploy}...")
-                    broker_instance = get_broker_instance(selected_broker_deploy)
-                    if broker_instance:
-                        if selected_broker_deploy == 'Alpaca':
-                            # Test Alpaca connection
-                            account = broker_instance.api.get_account()
-                            broker_connected = True
-                            account_status = account.status
-                            buying_power = float(account.buying_power)
-                            print(f"✅ Alpaca connected: status={account_status}, buying_power=${buying_power:,.2f}")
-                        elif selected_broker_deploy == 'IBKR':
-                            # Test IBKR connection
-                            if hasattr(broker_instance, 'ib') and broker_instance.ib.isConnected():
-                                broker_connected = True
-                                account_info = broker_instance.get_account_info()
-                                account_status = 'ACTIVE' if account_info else 'UNKNOWN'
-                                buying_power = account_info.get('buying_power', 0.0) if account_info else 0.0
-                                print(f"✅ IBKR connected: status={account_status}, buying_power=${buying_power:,.2f}")
-                            else:
-                                broker_connected = False
-                                print(f"❌ IBKR not connected or no IB instance")
-                        
-                        # Cache the connection status
-                        st.session_state[broker_cache_key] = broker_connected
-                        st.session_state[f'deploy_broker_instance_{selected_broker_deploy}'] = broker_instance
-                        st.session_state[f'deploy_buying_power_{selected_broker_deploy}'] = buying_power
-                        st.session_state[f'deploy_account_status_{selected_broker_deploy}'] = account_status
-                    else:
-                        broker_connected = False
-                        print(f"❌ No broker instance returned for {selected_broker_deploy}")
-                except Exception as e:
-                    broker_connected = False
-                    st.session_state[broker_cache_key] = False
-                    broker_name_display = selected_broker_deploy
-                    error_msg = str(e)
-                    print(f"❌ Broker connection error: {error_msg}")
-                    if selected_broker_deploy == 'Alpaca':
-                        st.warning(f"⚠️ **{broker_name_display} Connection**: {error_msg}")
-                        st.info("💡 **Note**: Ensure ALPACA_API_KEY and ALPACA_SECRET_KEY are set in environment variables")
-                    elif selected_broker_deploy == 'IBKR':
-                        st.warning(f"⚠️ **{broker_name_display} Connection**: {error_msg}")
-                        st.info("💡 **Note**: Ensure TWS or IB Gateway is running and API connections are enabled")
-        
-        # Display connection status with reconnect and refresh buttons
-        col_status, col_refresh, col_reconnect = st.columns([4, 0.8, 0.8])
-        with col_status:
-            if broker_connected:
-                broker_name_display = selected_broker_deploy
-                st.success(f"✅ **{broker_name_display} Connected** - Account Status: {account_status.upper()} | Buying Power: ${buying_power:,.2f}")
-            else:
-                st.error(f"❌ **{selected_broker_deploy} Not Connected** - Please check your broker connection")
-        
-        with col_refresh:
-            if broker_connected and st.button("🔄 Refresh", key="refresh_buying_power"):
-                # Refresh buying power without full reconnection
-                try:
-                    if selected_broker_deploy == 'Alpaca' and broker_instance:
-                        account = broker_instance.api.get_account()
-                        buying_power = float(account.buying_power)
-                        st.session_state[f'deploy_buying_power_{selected_broker_deploy}'] = buying_power
-                        st.success(f"Updated: ${buying_power:,.2f}")
-                    elif selected_broker_deploy == 'IBKR' and broker_instance:
+        try:
+            broker_instance = get_broker_instance(selected_broker_deploy)
+            if broker_instance:
+                if selected_broker_deploy == 'Alpaca':
+                    # Test Alpaca connection
+                    account = broker_instance.api.get_account()
+                    broker_connected = True
+                    account_status = account.status
+                    buying_power = float(account.buying_power)
+                elif selected_broker_deploy == 'IBKR':
+                    # Test IBKR connection
+                    if hasattr(broker_instance, 'ib') and broker_instance.ib.isConnected():
+                        broker_connected = True
                         account_info = broker_instance.get_account_info()
-                        buying_power = account_info.get('buying_power', 0.0)
-                        st.session_state[f'deploy_buying_power_{selected_broker_deploy}'] = buying_power
-                        st.success(f"Updated: ${buying_power:,.2f}")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Refresh failed: {e}")
+                        account_status = 'ACTIVE' if account_info else 'UNKNOWN'
+                        buying_power = account_info.get('buying_power', 0.0) if account_info else 0.0
+        except Exception as e:
+            broker_connected = False
+            broker_name_display = selected_broker_deploy
+            if selected_broker_deploy == 'Alpaca':
+                st.warning(f"⚠️ **{broker_name_display} Connection**: {str(e)}")
+                st.info("💡 **Note**: Ensure ALPACA_API_KEY and ALPACA_SECRET_KEY are set in environment variables")
+            elif selected_broker_deploy == 'IBKR':
+                st.warning(f"⚠️ **{broker_name_display} Connection**: {str(e)}")
+                st.info("💡 **Note**: Ensure TWS or IB Gateway is running and API connections are enabled")
         
-        with col_reconnect:
-            if st.button("🔌 Reconnect", key="reconnect_deploy_broker"):
-                # Clear cached connection status to force reconnection
-                st.session_state[broker_cache_key] = False
-                st.session_state[f'deploy_broker_instance_{selected_broker_deploy}'] = None
-                print(f"🔄 Reconnecting to {selected_broker_deploy}...")
-                st.rerun()
-        
-        # Debug info - show AFTER connection attempt
-        with st.expander("🔍 Connection Debug Info", expanded=False):
-            st.write(f"**Broker:** {selected_broker_deploy}")
-            st.write(f"**Cache Key:** {broker_cache_key}")
-            st.write(f"**Cached Connected:** {st.session_state.get(broker_cache_key, 'NOT SET')}")
-            st.write(f"**Broker Instance:** {st.session_state.get(f'deploy_broker_instance_{selected_broker_deploy}') is not None}")
-            st.write(f"**Current Connected:** {broker_connected}")
-            st.write(f"**Buying Power:** ${st.session_state.get(f'deploy_buying_power_{selected_broker_deploy}', 0.0):,.2f}")
-            st.write(f"**Account Status:** {st.session_state.get(f'deploy_account_status_{selected_broker_deploy}', 'None')}")
+        if broker_connected:
+            broker_name_display = selected_broker_deploy
+            st.success(f"✅ **{broker_name_display} Connected** - Account Status: {account_status.upper()} | Buying Power: ${buying_power:,.2f}")
         
         col_deploy1, col_deploy2 = st.columns([2, 1])
         
@@ -7594,8 +7480,6 @@ if tab_deployment:
             
             if ticker_deploy:
                 # Always fetch fresh price from broker (don't use cached session state)
-                current_price = None
-                
                 if broker_connected and broker_instance:
                     # Method 1: Try to get price from existing position (most reliable)
                     try:
@@ -7604,59 +7488,85 @@ if tab_deployment:
                             for pos in positions:
                                 if pos.symbol == ticker_deploy:
                                     current_price = float(pos.current_price)
-                                    if current_price > 0:
-                                        st.metric("Current Price", f"${current_price:.2f}")
-                                        st.caption(f"💰 Live price from {selected_broker_deploy} broker (from position)")
-                                        break
+                                    st.metric("Current Price", f"${current_price:.2f}")
+                                    st.caption(f"💰 Live price from {selected_broker_deploy} broker (from position)")
+                                    break
                         elif selected_broker_deploy == 'IBKR':
                             positions = broker_instance.get_positions()
                             for pos in positions:
                                 if pos['symbol'] == ticker_deploy:
-                                    # Only use position price if it's valid (> 0)
-                                    if pos['current_price'] > 0:
-                                        current_price = pos['current_price']
-                                        st.metric("Current Price", f"${current_price:.2f}")
-                                        st.caption(f"💰 Live price from {selected_broker_deploy} broker (from position)")
-                                        break
-                    except Exception as e:
-                        pass
-                
-                # For IBKR, skip other broker methods and go straight to yfinance (more reliable for Paper Trading)
-                # For Alpaca, try additional broker methods before falling back to yfinance
-                if current_price is None and selected_broker_deploy == 'Alpaca' and broker_connected and broker_instance:
-                    # Method 2: Try Alpaca-specific price fetching
-                    try:
-                        # Try Alpaca get_bars (if available)
-                        if hasattr(broker_instance.api, 'get_bars'):
-                            bars = broker_instance.api.get_bars(
-                                ticker_deploy,
-                                "1Min",
-                                limit=1
-                            )
-                            # Handle both DataFrame and list responses
-                            if hasattr(bars, 'df'):
-                                bars_df = bars.df
-                            elif isinstance(bars, list) and len(bars) > 0:
-                                import pandas as pd
-                                bars_df = pd.DataFrame([{
-                                    'close': bars[0].c,
-                                    'open': bars[0].o,
-                                    'high': bars[0].h,
-                                    'low': bars[0].l,
-                                    'volume': bars[0].v
-                                }])
-                            else:
-                                bars_df = None
-                            
-                            if bars_df is not None and not bars_df.empty:
-                                current_price = float(bars_df['close'].iloc[-1])
-                                st.metric("Current Price", f"${current_price:.2f}")
-                                st.caption(f"💰 Live price from {selected_broker_deploy} broker (1-minute bar)")
+                                    current_price = pos['current_price']
+                                    st.metric("Current Price", f"${current_price:.2f}")
+                                    st.caption(f"💰 Live price from {selected_broker_deploy} broker (from position)")
+                                    break
                     except Exception as e:
                         pass
                     
-                    # Method 3: Try Alpaca get_latest_trade
+                    # Method 2: Try broker-specific price fetching
                     if current_price is None:
+                        try:
+                            if selected_broker_deploy == 'Alpaca':
+                                # Try Alpaca get_bars (if available)
+                                if hasattr(broker_instance.api, 'get_bars'):
+                                    bars = broker_instance.api.get_bars(
+                                        ticker_deploy,
+                                        "1Min",
+                                        limit=1
+                                    )
+                                    # Handle both DataFrame and list responses
+                                    if hasattr(bars, 'df'):
+                                        bars_df = bars.df
+                                    elif isinstance(bars, list) and len(bars) > 0:
+                                        import pandas as pd
+                                        bars_df = pd.DataFrame([{
+                                            'close': bars[0].c,
+                                            'open': bars[0].o,
+                                            'high': bars[0].h,
+                                            'low': bars[0].l,
+                                            'volume': bars[0].v
+                                        }])
+                                    else:
+                                        bars_df = None
+                                    
+                                    if bars_df is not None and not bars_df.empty:
+                                        current_price = float(bars_df['close'].iloc[-1])
+                                        st.metric("Current Price", f"${current_price:.2f}")
+                                        st.caption(f"💰 Live price from {selected_broker_deploy} broker (1-minute bar)")
+                            elif selected_broker_deploy == 'IBKR':
+                                # Try IBKR market data - use broker's internal method
+                                try:
+                                    # Get positions to extract price (broker handles event loop)
+                                    positions = broker_instance.get_positions()
+                                    for pos in positions:
+                                        if pos['symbol'] == ticker_deploy:
+                                            current_price = pos['current_price']
+                                            if current_price and current_price > 0:
+                                                st.metric("Current Price", f"${current_price:.2f}")
+                                                st.caption(f"💰 Live price from {selected_broker_deploy} broker")
+                                                break
+                                except Exception as e:
+                                    # Fallback: try direct call with error handling
+                                    try:
+                                        from ib_insync import Stock
+                                        contract = Stock(ticker_deploy, 'SMART', 'USD')
+                                        # Ensure event loop exists before calling
+                                        if hasattr(broker_instance, '_ensure_event_loop'):
+                                            broker_instance._ensure_event_loop()
+                                        qualified = broker_instance.ib.qualifyContracts(contract)
+                                        if qualified:
+                                            ticker = broker_instance.ib.reqMktData(qualified[0], '', False, False)
+                                            broker_instance.ib.sleep(1)  # Wait for market data
+                                            if ticker.marketPrice():
+                                                current_price = ticker.marketPrice()
+                                                st.metric("Current Price", f"${current_price:.2f}")
+                                                st.caption(f"💰 Live price from {selected_broker_deploy} broker")
+                                    except Exception as e2:
+                                        pass  # Will fall back to yfinance
+                        except Exception as e:
+                            pass
+                    
+                    # Method 3: Try Alpaca get_latest_trade (Alpaca only)
+                    if current_price is None and selected_broker_deploy == 'Alpaca':
                         try:
                             if hasattr(broker_instance.api, 'get_latest_trade'):
                                 trade = broker_instance.api.get_latest_trade(ticker_deploy)
@@ -7671,46 +7581,29 @@ if tab_deployment:
                 if current_price is None:
                     try:
                         import yfinance as yf
-                        import numpy as np
                         ticker = yf.Ticker(ticker_deploy)
                         # Try to get latest price from 1-minute data
                         hist = ticker.history(period='1d', interval='1m')
                         if not hist.empty:
-                            price_val = hist['Close'].iloc[-1]
-                            # Check for NaN
-                            if pd.notna(price_val) and not np.isnan(price_val):
-                                current_price = float(price_val)
-                                st.metric("Current Price", f"${current_price:.2f}")
-                                st.caption("📈 Using yfinance (may be delayed 15-20 min)")
-                        
-                        if current_price is None:
+                            current_price = float(hist['Close'].iloc[-1])
+                            st.metric("Current Price", f"${current_price:.2f}")
+                            st.caption("⚠️ Using yfinance (delayed data)")
+                        else:
                             # Fallback to daily data
                             hist_daily = ticker.history(period='1d', interval='1d')
                             if not hist_daily.empty:
-                                price_val = hist_daily['Close'].iloc[-1]
-                                if pd.notna(price_val) and not np.isnan(price_val):
-                                    current_price = float(price_val)
+                                current_price = float(hist_daily['Close'].iloc[-1])
+                                st.metric("Current Price", f"${current_price:.2f}")
+                                st.caption("⚠️ Using yfinance daily (delayed data)")
+                            else:
+                                # Last resort: use info
+                                info = ticker.info
+                                if 'currentPrice' in info:
+                                    current_price = float(info['currentPrice'])
                                     st.metric("Current Price", f"${current_price:.2f}")
-                                    st.caption("📈 Using yfinance daily close")
-                        
-                        if current_price is None:
-                            # Last resort: use info
-                            info = ticker.info
-                            if 'currentPrice' in info and info.get('currentPrice'):
-                                price_val = info.get('currentPrice')
-                                if price_val and not np.isnan(price_val):
-                                    current_price = float(price_val)
-                                    st.metric("Current Price", f"${current_price:.2f}")
-                                    st.caption("📈 Using yfinance info")
-                            elif 'regularMarketPrice' in info and info.get('regularMarketPrice'):
-                                price_val = info.get('regularMarketPrice')
-                                if price_val and not np.isnan(price_val):
-                                    current_price = float(price_val)
-                                    st.metric("Current Price", f"${current_price:.2f}")
-                                    st.caption("📈 Using yfinance market price")
+                                    st.caption("⚠️ Using yfinance info (delayed data)")
                     except Exception as e:
-                        st.error(f"❌ Could not fetch price: {str(e)}")
-                        st.info("💡 Try a different ticker symbol or check your internet connection")
+                        st.warning(f"⚠️ Could not fetch price: {str(e)}")
                         current_price = None
                 
                 # Display bid/ask if available
@@ -7732,12 +7625,6 @@ if tab_deployment:
             else:
                 st.info("💡 Enter ticker symbol to see current price")
                 current_price = None
-            
-            # Store current price in session state for use in PREPARE button
-            if current_price:
-                st.session_state['deploy_current_price'] = current_price
-            else:
-                st.session_state['deploy_current_price'] = None
             
             # Always store fresh current_price in session state (refresh on every render)
             # This ensures PREPARE button always uses the latest price
@@ -8145,128 +8032,145 @@ if tab_deployment:
             # Enable PREPARE button if we have ticker and price (price can come from yfinance even if broker not connected)
             prepare_disabled = not ticker_deploy or deploy_current_price is None
             
-            # Debug info
-            if prepare_disabled:
-                reasons = []
-                if not ticker_deploy:
-                    reasons.append("No ticker entered")
-                if deploy_current_price is None:
-                    reasons.append("No price available")
-                st.caption(f"⚠️ PREPARE disabled: {', '.join(reasons)}")
-            
             if st.button("🔍 PREPARE", type="primary", use_container_width=True,
                         disabled=prepare_disabled):
-                st.write(f"🔍 PREPARE button clicked! ticker={ticker_deploy}, price={deploy_current_price}")
-                if ticker_deploy and deploy_current_price is not None and deploy_current_price > 0:
-                    st.info("🔍 Analyzing positions and calculating trench orders...")
-                    
-                    # Get current position for this ticker
-                    current_position_qty = current_positions.get(ticker_deploy, {}).get('quantity', 0)
-                    current_position_avg = current_positions.get(ticker_deploy, {}).get('avg_entry', deploy_current_price)
-                    
-                    # Determine action (BUY or SELL)
-                    action = "BUY"  # Default to BUY
-                    if current_position_qty > 0:
-                        # Check if we should add to position or reduce
-                        # For now, default to BUY (scaling in) or user can manually select SELL
-                        action = "BUY"  # Can be changed to SELL if needed
-                    
-                    proposed_orders = []
-                    
-                    # Calculate trench orders based on strategy type
-                    # For Inventory-Aware Trench Strategy, ALWAYS use macro regime sizing (it's built-in)
-                    force_macro_regime = (strategy_type_deploy == "Inventory-Aware Trench Strategy")
-                    if force_macro_regime or (use_macro_regime_deploy and strategy_type_deploy in ["Macro Regime Position Sizing (5-Trench Model)"]):
-                        # Force macro regime for Inventory-Aware Trench Strategy
-                        if force_macro_regime and not use_macro_regime_deploy:
-                            st.info("💡 **Inventory-Aware Trench Strategy** automatically uses Macro Regime Position Sizing")
-                            # Use default macro regime values if checkbox was unchecked
-                            # Get values from session state if available, otherwise use defaults
-                            macro_base_pct_deploy = st.session_state.get('deploy_macro_base', 0.04)
-                            macro_max_pct_deploy = st.session_state.get('deploy_macro_max', 0.15)
-                            macro_classification_deploy = st.session_state.get('deploy_macro_classification', 'CORE')
-                            classification_multiplier_deploy = 1.2 if macro_classification_deploy == "CORE" else 0.8
-                            macro_persona_deploy = st.session_state.get('deploy_macro_persona', 1.0)
-                            use_macro_regime_deploy = True  # Enable it for the rest of the logic
-                        # Use macro regime position sizing for trench calculation
-                        from backtesting.macro_regime import MacroRegimeDetector, FiveTrenchPositionSizer
-                        from data.realtime_data import get_data_provider
+                if ticker_deploy and deploy_current_price:
+                    try:
+                        st.info("🔍 Analyzing positions and calculating trench orders...")
                         
-                        # Get historical data for macro regime calculation
-                        data_provider = get_data_provider('auto')
-                        end_date = datetime.now()
-                        start_date = end_date - timedelta(days=90)
+                        # Get current position for this ticker
+                        current_position_qty = current_positions.get(ticker_deploy, {}).get('quantity', 0)
+                        current_position_avg = current_positions.get(ticker_deploy, {}).get('avg_entry', deploy_current_price)
                         
-                        try:
-                            hist_data = data_provider.get_historical_data(ticker_deploy, start_date, end_date)
-                            if hist_data is not None and len(hist_data) > 30:
-                                # Initialize macro regime detector and position sizer
-                                macro_detector = MacroRegimeDetector(use_real_macro=True)
-                                position_sizer = FiveTrenchPositionSizer(
-                                    base_pct=macro_base_pct_deploy,
-                                    max_position_pct=macro_max_pct_deploy,
-                                    macro_regime_detector=macro_detector
-                                )
-                                
-                                # Calculate total position size
-                                portfolio_value = buying_power if broker_connected else 100000.0
-                                total_quantity, breakdown = position_sizer.calculate_position_size(
-                                    portfolio_value=portfolio_value,
-                                    price=deploy_current_price,
-                                    data=hist_data,
-                                    classification_multiplier=classification_multiplier_deploy,
-                                    persona_multiplier=macro_persona_deploy,
-                                    current_date=datetime.now()
-                                )
-                                
-                                total_quantity = int(total_quantity)
-                                
-                                # Calculate number of trenches to deploy
-                                trench_levels = 3  # Default for Inventory-Aware Trench Strategy
-                                final_pct = breakdown.get('final_pct', macro_max_pct_deploy)
-                                standard_trench_size = macro_max_pct_deploy / trench_levels  # ~5% per trench
-                                
-                                # Determine number of trenches based on final position size
-                                # If final_pct is 15%, deploy all 3 trenches
-                                # If final_pct is 10%, deploy 2 trenches  
-                                # If final_pct is 5%, deploy 1 trench
-                                num_trenches = max(1, min(trench_levels, int(np.ceil(final_pct / standard_trench_size))))
-                                
-                                # Calculate per-trench quantity (distribute total across trenches)
-                                per_trench_qty = max(1, total_quantity // num_trenches) if num_trenches > 0 else total_quantity
-                                
-                                # IMPORTANT: Only prepare Trench 1 initially (incremental deployment)
-                                # Trenches 2 and 3 will be prepared later as price moves down
-                                # This matches the Inventory-Aware Trench Strategy behavior
-                                trench_num = 1  # Only deploy first trench
-                                # Trench 1 price: execute at current price (market order) or slightly below (limit)
-                                trench_price = deploy_current_price  # Execute at current price for Trench 1
-                                
-                                proposed_orders.append({
-                                    'trench': trench_num,
-                                    'action': action,
-                                    'symbol': ticker_deploy,
-                                    'quantity': per_trench_qty,
-                                    'price': round(trench_price, 2),
-                                    'order_type': 'MARKET',  # Market order for Trench 1 (immediate execution)
-                                    'total_value': per_trench_qty * trench_price,
-                                    'reason': f"Trench 1/{num_trenches}: Macro regime ({breakdown.get('regime_multiplier', 1.0):.2f}x regime, {final_pct*100:.1f}% total). Trenches 2-{num_trenches} will deploy incrementally as price moves."
-                                })
-                                
-                                # Store breakdown for display
-                                st.session_state.macro_breakdown = breakdown
-                                
-                                st.success(f"✅ **Prepared Trench 1 Order using Macro Regime Position Sizing**")
-                                st.info(f"📊 **Trench 1**: {per_trench_qty} shares ({per_trench_qty * deploy_current_price / portfolio_value * 100:.2f}% of portfolio) | "
-                                       f"**Total Target**: {total_quantity} shares across {num_trenches} trenches ({final_pct*100:.2f}% total) | "
-                                       f"Regime: {breakdown.get('regime_multiplier', 1.0):.2f}x | "
-                                       f"Volatility: {breakdown.get('volatility_multiplier', 1.0):.2f}x")
-                                st.caption(f"💡 **Incremental Deployment**: Trenches 2-{num_trenches} will be prepared later as price moves down to their levels.")
-                                
-                            else:
-                                # Fallback: Standard trench sizing - use max cap
-                                portfolio_value = buying_power if broker_connected else 100000.0
-                                position_pct = macro_max_pct_deploy if use_macro_regime_deploy else 0.15
+                        # Determine action (BUY or SELL)
+                        action = "BUY"  # Default to BUY
+                        if current_position_qty > 0:
+                            # Check if we should add to position or reduce
+                            # For now, default to BUY (scaling in) or user can manually select SELL
+                            action = "BUY"  # Can be changed to SELL if needed
+                        
+                        proposed_orders = []
+                        
+                        # Calculate trench orders based on strategy type
+                        # For Inventory-Aware Trench Strategy, ALWAYS use macro regime sizing (it's built-in)
+                        force_macro_regime = (strategy_type_deploy == "Inventory-Aware Trench Strategy")
+                        if force_macro_regime or (use_macro_regime_deploy and strategy_type_deploy in ["Macro Regime Position Sizing (5-Trench Model)"]):
+                            # Force macro regime for Inventory-Aware Trench Strategy
+                            if force_macro_regime and not use_macro_regime_deploy:
+                                st.info("💡 **Inventory-Aware Trench Strategy** automatically uses Macro Regime Position Sizing")
+                                # Use default macro regime values if checkbox was unchecked
+                                # Get values from session state if available, otherwise use defaults
+                                macro_base_pct_deploy = st.session_state.get('deploy_macro_base', 0.04)
+                                macro_max_pct_deploy = st.session_state.get('deploy_macro_max', 0.15)
+                                macro_classification_deploy = st.session_state.get('deploy_macro_classification', 'CORE')
+                                classification_multiplier_deploy = 1.2 if macro_classification_deploy == "CORE" else 0.8
+                                macro_persona_deploy = st.session_state.get('deploy_macro_persona', 1.0)
+                                use_macro_regime_deploy = True  # Enable it for the rest of the logic
+                            # Use macro regime position sizing for trench calculation
+                            from backtesting.macro_regime import MacroRegimeDetector, FiveTrenchPositionSizer
+                            from data.realtime_data import get_data_provider
+                            
+                            # Get historical data for macro regime calculation
+                            data_provider = get_data_provider('auto')
+                            end_date = datetime.now()
+                            start_date = end_date - timedelta(days=90)
+                            
+                            try:
+                                hist_data = data_provider.get_historical_data(ticker_deploy, start_date, end_date)
+                                if hist_data is not None and len(hist_data) > 30:
+                                    # Initialize macro regime detector and position sizer
+                                    macro_detector = MacroRegimeDetector(use_real_macro=True)
+                                    position_sizer = FiveTrenchPositionSizer(
+                                        base_pct=macro_base_pct_deploy,
+                                        max_position_pct=macro_max_pct_deploy,
+                                        macro_regime_detector=macro_detector
+                                    )
+                                    
+                                    # Calculate total position size
+                                    portfolio_value = buying_power if broker_connected else 100000.0
+                                    total_quantity, breakdown = position_sizer.calculate_position_size(
+                                        portfolio_value=portfolio_value,
+                                        price=deploy_current_price,
+                                        data=hist_data,
+                                        classification_multiplier=classification_multiplier_deploy,
+                                        persona_multiplier=macro_persona_deploy,
+                                        current_date=datetime.now()
+                                    )
+                                    
+                                    total_quantity = int(total_quantity)
+                                    
+                                    # Calculate number of trenches to deploy
+                                    trench_levels = 3  # Default for Inventory-Aware Trench Strategy
+                                    final_pct = breakdown.get('final_pct', macro_max_pct_deploy)
+                                    standard_trench_size = macro_max_pct_deploy / trench_levels  # ~5% per trench
+                                    
+                                    # Determine number of trenches based on final position size
+                                    # If final_pct is 15%, deploy all 3 trenches
+                                    # If final_pct is 10%, deploy 2 trenches  
+                                    # If final_pct is 5%, deploy 1 trench
+                                    num_trenches = max(1, min(trench_levels, int(np.ceil(final_pct / standard_trench_size))))
+                                    
+                                    # Calculate per-trench quantity (distribute total across trenches)
+                                    per_trench_qty = max(1, total_quantity // num_trenches) if num_trenches > 0 else total_quantity
+                                    
+                                    # IMPORTANT: Only prepare Trench 1 initially (incremental deployment)
+                                    # Trenches 2 and 3 will be prepared later as price moves down
+                                    # This matches the Inventory-Aware Trench Strategy behavior
+                                    trench_num = 1  # Only deploy first trench
+                                    # Trench 1 price: execute at current price (market order) or slightly below (limit)
+                                    trench_price = deploy_current_price  # Execute at current price for Trench 1
+                                    
+                                    proposed_orders.append({
+                                        'trench': trench_num,
+                                        'action': action,
+                                        'symbol': ticker_deploy,
+                                        'quantity': per_trench_qty,
+                                        'price': round(trench_price, 2),
+                                        'order_type': 'MARKET',  # Market order for Trench 1 (immediate execution)
+                                        'total_value': per_trench_qty * trench_price,
+                                        'reason': f"Trench 1/{num_trenches}: Macro regime ({breakdown.get('regime_multiplier', 1.0):.2f}x regime, {final_pct*100:.1f}% total). Trenches 2-{num_trenches} will deploy incrementally as price moves."
+                                    })
+                                    
+                                    # Store breakdown for display
+                                    st.session_state.macro_breakdown = breakdown
+                                    
+                                    st.success(f"✅ **Prepared Trench 1 Order using Macro Regime Position Sizing**")
+                                    st.info(f"📊 **Trench 1**: {per_trench_qty} shares ({per_trench_qty * deploy_current_price / portfolio_value * 100:.2f}% of portfolio) | "
+                                           f"**Total Target**: {total_quantity} shares across {num_trenches} trenches ({final_pct*100:.2f}% total) | "
+                                           f"Regime: {breakdown.get('regime_multiplier', 1.0):.2f}x | "
+                                           f"Volatility: {breakdown.get('volatility_multiplier', 1.0):.2f}x")
+                                    st.caption(f"💡 **Incremental Deployment**: Trenches 2-{num_trenches} will be prepared later as price moves down to their levels.")
+                                    
+                                else:
+                                    # Fallback: Standard trench sizing - use max cap
+                                    portfolio_value = buying_power if broker_connected else 100000.0
+                                    position_pct = macro_max_pct_deploy if use_macro_regime_deploy else 0.15
+                                    total_quantity = int((portfolio_value * position_pct) / deploy_current_price)
+                                    trench_levels = 3
+                                    per_trench_qty = max(1, total_quantity // trench_levels)
+                                    
+                                    # Only prepare Trench 1 initially (incremental deployment)
+                                    trench_num = 1
+                                    proposed_orders.append({
+                                        'trench': trench_num,
+                                        'action': action,
+                                        'symbol': ticker_deploy,
+                                        'quantity': per_trench_qty,
+                                        'price': deploy_current_price,
+                                        'order_type': 'MARKET',
+                                        'total_value': per_trench_qty * deploy_current_price,
+                                        'reason': f"Trench 1/{trench_levels}: Standard sizing (insufficient data). Trenches 2-{trench_levels} will deploy incrementally."
+                                    })
+                                    
+                                    st.info(f"⚠️ Using standard sizing: Trench 1 only ({per_trench_qty} shares, {position_pct*100:.1f}% total across {trench_levels} trenches)")
+                            except Exception as e:
+                                st.error(f"❌ **Macro regime calculation failed**: {str(e)}")
+                                import traceback
+                                with st.expander("Error Details"):
+                                    st.code(traceback.format_exc())
+                                # Fallback: Use standard trench sizing - only Trench 1 initially
+                                portfolio_value = buying_power if alpaca_connected else 100000.0
+                                position_pct = macro_max_pct_deploy if (use_macro_regime_deploy or force_macro_regime) else 0.15
                                 total_quantity = int((portfolio_value * position_pct) / deploy_current_price)
                                 trench_levels = 3
                                 per_trench_qty = max(1, total_quantity // trench_levels)
@@ -8281,71 +8185,41 @@ if tab_deployment:
                                     'price': deploy_current_price,
                                     'order_type': 'MARKET',
                                     'total_value': per_trench_qty * deploy_current_price,
-                                    'reason': f"Trench 1/{trench_levels}: Standard sizing (insufficient data). Trenches 2-{trench_levels} will deploy incrementally."
+                                    'reason': f"Trench 1/{trench_levels}: Fallback sizing ({position_pct*100:.1f}% total - macro regime error). Trenches 2-{trench_levels} will deploy incrementally."
                                 })
                                 
-                                st.info(f"⚠️ Using standard sizing: Trench 1 only ({per_trench_qty} shares, {position_pct*100:.1f}% total across {trench_levels} trenches)")
-                        
-                        except Exception as e:
-                            st.error(f"❌ **Macro regime calculation failed**: {str(e)}")
-                            import traceback
-                            with st.expander("Error Details"):
-                                st.code(traceback.format_exc())
-                            # Fallback: Use standard trench sizing - only Trench 1 initially
-                            portfolio_value = buying_power if broker_connected else 100000.0
-                            position_pct = macro_max_pct_deploy if (use_macro_regime_deploy or force_macro_regime) else 0.15
-                            total_quantity = int((portfolio_value * position_pct) / deploy_current_price)
-                            trench_levels = 3
-                            per_trench_qty = max(1, total_quantity // trench_levels)
-                            
-                            # Only prepare Trench 1 initially (incremental deployment)
-                            trench_num = 1
+                                st.warning(f"⚠️ Using fallback sizing: Trench 1 only ({per_trench_qty} shares, {position_pct*100:.1f}% total across {trench_levels} trenches)")
+                        else:
+                            # Standard single order (non-trench strategy)
+                            # Only use this path for non-trench strategies
+                            if strategy_type_deploy == "Inventory-Aware Trench Strategy":
+                                st.error("❌ **Error**: Inventory-Aware Trench Strategy should use macro regime sizing. Please check your configuration.")
+                            portfolio_value = buying_power if alpaca_connected else 100000.0
+                            # Use the configured max cap, not hardcoded 10%
+                            position_pct = macro_max_pct_deploy if use_macro_regime_deploy else 0.15
+                            quantity = int((portfolio_value * position_pct) / deploy_current_price)
                             proposed_orders.append({
-                                'trench': trench_num,
+                                'trench': 1,
                                 'action': action,
                                 'symbol': ticker_deploy,
-                                'quantity': per_trench_qty,
+                                'quantity': quantity,
                                 'price': deploy_current_price,
                                 'order_type': 'MARKET',
-                                'total_value': per_trench_qty * deploy_current_price,
-                                'reason': f"Trench 1/{trench_levels}: Fallback sizing ({position_pct*100:.1f}% total - macro regime error). Trenches 2-{trench_levels} will deploy incrementally."
+                                'total_value': quantity * deploy_current_price,
+                                'reason': f'Standard order ({position_pct*100:.1f}% - respects {macro_max_pct_deploy*100:.0f}% cap)'
                             })
-                            
-                            st.warning(f"⚠️ Using fallback sizing: Trench 1 only ({per_trench_qty} shares, {position_pct*100:.1f}% total across {trench_levels} trenches)")
-                    
-                    else:
-                        # Standard single order (non-trench strategy)
-                        # Only use this path for non-trench strategies
-                        if strategy_type_deploy == "Inventory-Aware Trench Strategy":
-                            st.error("❌ **Error**: Inventory-Aware Trench Strategy should use macro regime sizing. Please check your configuration.")
-                        portfolio_value = buying_power if broker_connected else 100000.0
-                        # Use the configured max cap, not hardcoded 10%
-                        position_pct = macro_max_pct_deploy if use_macro_regime_deploy else 0.15
-                        quantity = int((portfolio_value * position_pct) / deploy_current_price)
-                        proposed_orders.append({
-                            'trench': 1,
-                            'action': action,
-                            'symbol': ticker_deploy,
-                            'quantity': quantity,
-                            'price': deploy_current_price,
-                            'order_type': 'MARKET',
-                            'total_value': quantity * deploy_current_price,
-                            'reason': f'Standard order ({position_pct*100:.1f}% - respects {macro_max_pct_deploy*100:.0f}% cap)'
-                        })
-                    
-                    # Store prepared orders in session state
-                    st.session_state.prepared_orders = proposed_orders
-                    st.session_state.prepared_action = action
-                    st.session_state.prepared_ticker = ticker_deploy
-                    st.rerun()
-                else:
-                    # Show appropriate error message
-                    if not ticker_deploy:
-                        st.error("❌ Please enter a ticker symbol")
-                    elif deploy_current_price is None:
-                        st.error("❌ Price not available. Please wait for price to load or try a different ticker.")
-                    elif deploy_current_price <= 0:
-                        st.error(f"❌ Invalid price: ${deploy_current_price}. The price fetching may have failed. Please refresh or try again.")
+                        
+                        # Store prepared orders in session state
+                        st.session_state.prepared_orders = proposed_orders
+                        st.session_state.prepared_action = action
+                        st.session_state.prepared_ticker = ticker_deploy
+                        st.rerun()
+                        
+                    except Exception as e:
+                        st.error(f"❌ **Preparation Error**: {str(e)}")
+                        import traceback
+                        with st.expander("Error Details"):
+                            st.code(traceback.format_exc())
         
         # Display Prepared Orders
         if st.session_state.prepared_orders:
@@ -8387,223 +8261,167 @@ if tab_deployment:
             
             st.info(f"💰 **Total Order Value**: ${total_value:,.2f}")
             
-            # Execute button section
-            st.markdown("---")
-            
-            # Enhanced debug info
-            debug_col1, debug_col2, debug_col3 = st.columns(3)
-            with debug_col1:
-                st.caption(f"🔌 Broker: {broker_connected} ({'✅' if broker_connected else '❌'})")
-            with debug_col2:
-                st.caption(f"📦 Orders: {len(st.session_state.prepared_orders)}")
-            with debug_col3:
-                st.caption(f"🔑 Instance: {broker_instance is not None}")
-            
-            # Show why button is disabled if it is
-            execute_disabled = not broker_connected or len(st.session_state.prepared_orders) == 0
-            if execute_disabled:
-                reasons = []
-                if not broker_connected:
-                    reasons.append("Broker not connected")
-                if len(st.session_state.prepared_orders) == 0:
-                    reasons.append("No orders prepared")
-                st.warning(f"⚠️ Execute button disabled: {', '.join(reasons)}")
-            
-            if st.session_state.prepared_action == "BUY":
-                button_color = "primary"
-                button_text = "🟢 EXECUTE BUY"
-            else:
-                button_color = "secondary"
-                button_text = "🔴 EXECUTE SELL"
-            
-            if st.button(button_text, type=button_color, use_container_width=True, disabled=execute_disabled, key="execute_buy_button"):
-                # Execute all prepared orders
-                print(f"🚀 EXECUTE BUTTON CLICKED! Orders={len(st.session_state.prepared_orders)}, Broker={broker_instance is not None}")
-                st.write("🚀 **Button clicked! Processing orders...**")
-                executed_count = 0
-                failed_count = 0
-                order_ids = []
+            # Execute button
+            with col_execute:
+                # Debug info
+                st.caption(f"Debug: Broker Connected={broker_connected}, Orders={len(st.session_state.prepared_orders)}")
                 
-                if not broker_instance:
-                    st.error("❌ **Critical Error**: Broker instance is None. Cannot execute orders.")
-                    st.info(f"Debug: selected_broker={selected_broker_deploy}, broker_connected={broker_connected}")
-                    st.stop()
+                execute_disabled = not broker_connected or len(st.session_state.prepared_orders) == 0
                 
-                print(f"Processing {len(st.session_state.prepared_orders)} orders...")
-                for order in st.session_state.prepared_orders:
-                    try:
-                        print(f"Processing order: Trench {order.get('trench')}, Symbol {order.get('symbol')}, Qty {order.get('quantity')}")
-                        from oms.oms import OrderManager, Order, OrderType, OrderStatus
-                        
-                        order_type_map = {
-                            'MARKET': OrderType.MARKET,
-                            'LIMIT': OrderType.LIMIT
-                        }
-                        
-                        # Validate order data before creating
-                        if not order.get('symbol') or not order.get('quantity') or order['quantity'] <= 0:
-                            failed_count += 1
-                            st.error(f"❌ Invalid order data for trench {order['trench']}: symbol={order.get('symbol')}, quantity={order.get('quantity')}")
-                            continue
-                        
-                        # Check buying power for BUY orders
-                        if order['action'].upper() == 'BUY' and broker_instance:
-                            try:
-                                order_value = order['quantity'] * order['price']
-                                if buying_power and order_value > buying_power:
-                                    failed_count += 1
-                                    st.error(f"❌ Trench {order['trench']}: Insufficient buying power. "
-                                           f"Need ${order_value:,.2f} but only have ${buying_power:,.2f} available.")
-                                    continue
-                            except Exception as e:
-                                st.warning(f"⚠️ Could not verify buying power: {e}")
-                        
-                        oms_order = Order(
-                            symbol=order['symbol'],
-                            side=order['action'].upper(),  # BUY or SELL (uppercase)
-                            quantity=order['quantity'],
-                            order_type=order_type_map.get(order['order_type'], OrderType.MARKET),
-                            price=order['price'] if order['order_type'] == 'LIMIT' else None,
-                            time_in_force='DAY'
-                        )
-                        
-                        user_id = st.session_state.get('user_id', 1)
-                        
-                        # Ensure broker_instance is available
-                        if not broker_instance:
-                            failed_count += 1
-                            st.error(f"❌ Broker not connected. Please connect to Alpaca first.")
-                            continue
-                        
-                        oms = OrderManager(broker=broker_instance)
-                        print(f"📤 Submitting order to OMS: {order['symbol']} x{order['quantity']}")
+                if st.session_state.prepared_action == "BUY":
+                    button_color = "primary"
+                    button_text = "🟢 EXECUTE BUY"
+                else:
+                    button_color = "secondary"
+                    button_text = "🔴 EXECUTE SELL"
+                
+                if st.button(button_text, type=button_color, use_container_width=True, disabled=execute_disabled):
+                    # Execute all prepared orders
+                    executed_count = 0
+                    failed_count = 0
+                    order_ids = []
+                    
+                    for order in st.session_state.prepared_orders:
                         try:
-                            print(f"   Creating order object: {oms_order}")
+                            from oms.oms import OrderManager, Order, OrderType, OrderStatus
+                            
+                            order_type_map = {
+                                'MARKET': OrderType.MARKET,
+                                'LIMIT': OrderType.LIMIT
+                            }
+                            
+                            # Validate order data before creating
+                            if not order.get('symbol') or not order.get('quantity') or order['quantity'] <= 0:
+                                failed_count += 1
+                                st.error(f"❌ Invalid order data for trench {order['trench']}: symbol={order.get('symbol')}, quantity={order.get('quantity')}")
+                                continue
+                            
+                            # Check buying power for BUY orders
+                            if order['action'].upper() == 'BUY' and broker_instance:
+                                try:
+                                    order_value = order['quantity'] * order['price']
+                                    if buying_power and order_value > buying_power:
+                                        failed_count += 1
+                                        st.error(f"❌ Trench {order['trench']}: Insufficient buying power. "
+                                               f"Need ${order_value:,.2f} but only have ${buying_power:,.2f} available.")
+                                        continue
+                                except Exception as e:
+                                    st.warning(f"⚠️ Could not verify buying power: {e}")
+                            
+                            oms_order = Order(
+                                symbol=order['symbol'],
+                                side=order['action'].upper(),  # BUY or SELL (uppercase)
+                                quantity=order['quantity'],
+                                order_type=order_type_map.get(order['order_type'], OrderType.MARKET),
+                                price=order['price'] if order['order_type'] == 'LIMIT' else None,
+                                time_in_force='DAY'
+                            )
+                            
+                            user_id = st.session_state.get('user_id', 1)
+                            
+                            # Ensure broker_instance is available
+                            if not broker_instance:
+                                failed_count += 1
+                                st.error(f"❌ Broker not connected. Please connect to Alpaca first.")
+                                continue
+                            
+                            oms = OrderManager(broker=broker_instance)
                             submitted_order = oms.create_order(oms_order, user_id)
-                            print(f"✅ Order submitted! Status: {submitted_order.status if hasattr(submitted_order, 'status') else 'UNKNOWN'}")
-                            print(f"   Broker Order ID: {submitted_order.broker_order_id if hasattr(submitted_order, 'broker_order_id') else 'NONE'}")
-                            print(f"   Rejection Reason: {submitted_order.rejection_reason if hasattr(submitted_order, 'rejection_reason') else 'NONE'}")
-                        except Exception as oms_error:
-                            failed_count += 1
-                            error_details = str(oms_error)
-                            print(f"❌ OMS submission error: {error_details}")
-                            st.error(f"❌ Trench {order['trench']}: Order submission failed - {error_details}")
-                            if 'not supported' in error_details.lower() or 'invalid symbol' in error_details.lower():
-                                st.warning(f"💡 Tip: Symbol {order['symbol']} may not be supported by {selected_broker_deploy}. Try a US stock like AAPL, GOOGL, or MSFT.")
-                            continue
-                        
-                        # Check order status more carefully
-                        order_status = submitted_order.status.value if hasattr(submitted_order.status, 'value') else str(submitted_order.status)
-                        
-                        # Get rejection reason if available
-                        rejection_reason = None
-                        if hasattr(submitted_order, 'rejection_reason'):
-                            rejection_reason = submitted_order.rejection_reason
-                        
-                        if order_status == "REJECTED":
-                            failed_count += 1
-                            error_msg = f"❌ Trench {order['trench']}: Order rejected by broker"
-                            if rejection_reason:
-                                error_msg += f" - {rejection_reason}"
-                            st.error(error_msg)
                             
-                            # Show detailed rejection info
-                            with st.expander(f"🔍 Rejection Details for Trench {order['trench']}"):
-                                st.markdown(f"""
-                                **Order Details:**
-                                - Symbol: {order['symbol']}
-                                - Quantity: {order['quantity']} shares
-                                - Order Type: {order['order_type']}
-                                - Price: ${order['price']:.2f}
-                                - Status: {order_status}
-                                """)
+                            # Check order status more carefully
+                            order_status = submitted_order.status.value if hasattr(submitted_order.status, 'value') else str(submitted_order.status)
+                            
+                            # Get rejection reason if available
+                            rejection_reason = None
+                            if hasattr(submitted_order, 'rejection_reason'):
+                                rejection_reason = submitted_order.rejection_reason
+                            
+                            if order_status == "REJECTED":
+                                failed_count += 1
+                                error_msg = f"❌ Trench {order['trench']}: Order rejected by broker"
                                 if rejection_reason:
-                                    st.markdown(f"**Rejection Reason:** {rejection_reason}")
+                                    error_msg += f" - {rejection_reason}"
+                                st.error(error_msg)
                                 
-                                st.markdown("""
-                                **Common Alpaca Rejection Reasons:**
-                                - **Insufficient Buying Power**: Not enough cash (need ${order['total_value']:.2f})
-                                - **Invalid Symbol**: Ticker not recognized
-                                - **Market Closed**: Market orders only work during market hours
-                                - **Price Too Far**: Limit price too far from market (use market order instead)
-                                - **Fractional Shares**: Quantity must be whole number
+                                # Show detailed rejection info
+                                with st.expander(f"🔍 Rejection Details for Trench {order['trench']}"):
+                                    st.markdown(f"""
+                                    **Order Details:**
+                                    - Symbol: {order['symbol']}
+                                    - Quantity: {order['quantity']} shares
+                                    - Order Type: {order['order_type']}
+                                    - Price: ${order['price']:.2f}
+                                    - Status: {order_status}
+                                    """)
+                                    if rejection_reason:
+                                        st.markdown(f"**Rejection Reason:** {rejection_reason}")
+                                    
+                                    st.markdown("""
+                                    **Common Alpaca Rejection Reasons:**
+                                    - **Insufficient Buying Power**: Not enough cash (need ${order['total_value']:.2f})
+                                    - **Invalid Symbol**: Ticker not recognized
+                                    - **Market Closed**: Market orders only work during market hours
+                                    - **Price Too Far**: Limit price too far from market (use market order instead)
+                                    - **Fractional Shares**: Quantity must be whole number
+                                    
+                                    **Quick Fixes:**
+                                    1. Check buying power: Ensure you have at least ${order['total_value']:.2f} available
+                                    2. Use MARKET order instead of LIMIT if market is open
+                                    3. Verify symbol: {order['symbol']} is tradeable
+                                    4. Check market hours: Market orders only work 9:30 AM - 4:00 PM ET
+                                    """)
+                            elif submitted_order.broker_order_id or order_status in ["SUBMITTED", "PENDING", "ACCEPTED", "NEW"]:
+                                executed_count += 1
+                                if submitted_order.broker_order_id:
+                                    order_ids.append(submitted_order.broker_order_id)
                                 
-                                **Quick Fixes:**
-                                1. Check buying power: Ensure you have at least ${order['total_value']:.2f} available
-                                2. Use MARKET order instead of LIMIT if market is open
-                                3. Verify symbol: {order['symbol']} is tradeable
-                                4. Check market hours: Market orders only work 9:30 AM - 4:00 PM ET
-                                """)
-                        elif submitted_order.broker_order_id or order_status in ["SUBMITTED", "PENDING", "ACCEPTED", "NEW"]:
-                            executed_count += 1
-                            if submitted_order.broker_order_id:
-                                order_ids.append(submitted_order.broker_order_id)
-                            print(f"✅ Order accepted! ID: {submitted_order.broker_order_id or 'PENDING'}, Status: {order_status}")
-                            st.success(f"✅ Trench {order['trench']}: Order submitted successfully! Symbol: {order['symbol']}, Qty: {order['quantity']}, ID: {submitted_order.broker_order_id or 'PENDING'}")
-                            
-                            # Log the trade
-                            if 'deployment_trades' not in st.session_state:
-                                st.session_state.deployment_trades = []
-                            st.session_state.deployment_trades.append({
-                                'date': datetime.now(),
-                                'symbol': order['symbol'],
-                                'action': order['action'],
-                                'quantity': order['quantity'],
-                                'price': order['price'],
-                                'order_id': submitted_order.broker_order_id or 'PENDING',
-                                'status': order_status,
-                                'trench': order['trench'],
-                                'strategy': strategy_type_deploy,
-                                'macro_regime': use_macro_regime_deploy
-                            })
-                        else:
+                                # Log the trade
+                                if 'deployment_trades' not in st.session_state:
+                                    st.session_state.deployment_trades = []
+                                st.session_state.deployment_trades.append({
+                                    'date': datetime.now(),
+                                    'symbol': order['symbol'],
+                                    'action': order['action'],
+                                    'quantity': order['quantity'],
+                                    'price': order['price'],
+                                    'order_id': submitted_order.broker_order_id or 'PENDING',
+                                    'status': order_status,
+                                    'trench': order['trench'],
+                                    'strategy': strategy_type_deploy,
+                                    'macro_regime': use_macro_regime_deploy
+                                })
+                            else:
+                                failed_count += 1
+                                st.error(f"❌ Trench {order['trench']}: Unexpected order status '{order_status}' (expected SUBMITTED)")
+                                st.info(f"Order details: Symbol={order['symbol']}, Qty={order['quantity']}, Type={order['order_type']}, Price=${order['price']:.2f}")
+                        except Exception as e:
                             failed_count += 1
-                            st.error(f"❌ Trench {order['trench']}: Unexpected order status '{order_status}' (expected SUBMITTED)")
-                            st.info(f"Order details: Symbol={order['symbol']}, Qty={order['quantity']}, Type={order['order_type']}, Price=${order['price']:.2f}")
-                    except Exception as e:
-                        failed_count += 1
-                        import traceback
-                        error_msg = str(e)
-                        st.error(f"❌ Failed to execute trench {order.get('trench', '?')}: {error_msg}")
-                        with st.expander(f"Error Details for Trench {order.get('trench', '?')}"):
-                            st.code(traceback.format_exc())
+                            import traceback
+                            error_msg = str(e)
+                            st.error(f"❌ Failed to execute trench {order.get('trench', '?')}: {error_msg}")
+                            with st.expander(f"Error Details for Trench {order.get('trench', '?')}"):
+                                st.code(traceback.format_exc())
+                    
+                    # Clear prepared orders after execution
+                    st.session_state.prepared_orders = []
+                    if 'macro_breakdown' in st.session_state:
+                        del st.session_state.macro_breakdown
+                    
+                    if executed_count > 0:
+                        st.success(f"✅ **Executed {executed_count} orders successfully!**")
+                        if order_ids:
+                            st.info(f"📋 **Order IDs**: {', '.join(order_ids[:5])}{'...' if len(order_ids) > 5 else ''}")
+                    if failed_count > 0:
+                        st.error(f"❌ **Failed to execute {failed_count} orders**")
+                    
+                    st.rerun()
                 
-                # Clear prepared orders after execution
-                st.session_state.prepared_orders = []
-                if 'macro_breakdown' in st.session_state:
-                    del st.session_state.macro_breakdown
-                
-                # Refresh buying power after order execution
-                if executed_count > 0 and broker_instance:
-                    try:
-                        if selected_broker_deploy == 'Alpaca':
-                            account = broker_instance.api.get_account()
-                            new_buying_power = float(account.buying_power)
-                            st.session_state[f'deploy_buying_power_{selected_broker_deploy}'] = new_buying_power
-                            print(f"💰 Buying power refreshed: ${new_buying_power:,.2f}")
-                        elif selected_broker_deploy == 'IBKR':
-                            account_info = broker_instance.get_account_info()
-                            new_buying_power = account_info.get('buying_power', 0.0)
-                            st.session_state[f'deploy_buying_power_{selected_broker_deploy}'] = new_buying_power
-                            print(f"💰 Buying power refreshed: ${new_buying_power:,.2f}")
-                    except Exception as e:
-                        print(f"⚠️ Could not refresh buying power: {e}")
-                
-                if executed_count > 0:
-                    st.success(f"✅ **Executed {executed_count} orders successfully!**")
-                    if order_ids:
-                        st.info(f"📋 **Order IDs**: {', '.join(order_ids[:5])}{'...' if len(order_ids) > 5 else ''}")
-                if failed_count > 0:
-                    st.error(f"❌ **Failed to execute {failed_count} orders**")
-                
-                st.rerun()
-            
-            # Clear prepared orders button
-            if st.button("🗑️ Clear Prepared Orders", use_container_width=True):
-                st.session_state.prepared_orders = []
-                if 'macro_breakdown' in st.session_state:
-                    del st.session_state.macro_breakdown
-                st.rerun()
+                # Clear prepared orders button
+                if st.button("🗑️ Clear Prepared Orders", use_container_width=True):
+                    st.session_state.prepared_orders = []
+                    if 'macro_breakdown' in st.session_state:
+                        del st.session_state.macro_breakdown
+                    st.rerun()
         
         # Legacy BUY/SELL buttons (kept for quick actions, but Prepare is recommended)
         st.markdown("---")
@@ -8677,12 +8495,12 @@ if tab_deployment:
                             except Exception as e:
                                 st.warning(f"⚠️ Macro regime calculation failed: {str(e)}")
                                 # Fallback to standard sizing
-                                portfolio_value = buying_power if broker_connected else 100000.0
+                                portfolio_value = buying_power if alpaca_connected else 100000.0
                                 position_pct = macro_max_pct_deploy if use_macro_regime_deploy else 0.10
                                 quantity = int((portfolio_value * position_pct) / current_price)
                         else:
                             # Standard position sizing
-                            portfolio_value = buying_power if broker_connected else 100000.0
+                            portfolio_value = buying_power if alpaca_connected else 100000.0
                             position_pct = 0.10  # Default 10%
                             quantity = int((portfolio_value * position_pct) / current_price)
                         

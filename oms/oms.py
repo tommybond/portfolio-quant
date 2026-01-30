@@ -72,48 +72,75 @@ class OrderManager:
     
     def create_order(self, order: Order, user_id: int) -> Order:
         """Create and submit an order"""
+        print(f"🔷 OMS.create_order called: {order.symbol} x{order.quantity}, user={user_id}")
+        
         # Validate order
+        print(f"   Validating order...")
         if not self._validate_order(order):
+            print(f"   ❌ Order validation failed")
             order.status = OrderStatus.REJECTED
             return order
+        print(f"   ✅ Order validation passed")
         
         # Pre-trade risk checks
+        print(f"   Running pre-trade checks...")
         if not self._pre_trade_checks(order, user_id):
+            print(f"   ❌ Pre-trade checks failed")
             order.status = OrderStatus.REJECTED
             return order
+        print(f"   ✅ Pre-trade checks passed")
         
         # Submit to broker if available
         if self.broker:
+            print(f"   📤 Submitting to broker: {self.broker.__class__.__name__}")
             try:
                 broker_response = self.broker.submit_order(order)
+                print(f"   ✅ Broker response received: {broker_response}")
+                
                 order.broker_order_id = broker_response.get('order_id')
+                print(f"   Broker order ID: {order.broker_order_id}")
                 
                 # Check if broker rejected the order
-                broker_status = broker_response.get('status', '')
-                if broker_status in ['rejected', 'REJECTED', 'reject']:
+                broker_status = broker_response.get('status', '').upper()
+                print(f"   Broker status: {broker_status}")
+                
+                if broker_status == 'REJECTED':
                     order.status = OrderStatus.REJECTED
                     # Store rejection reason if available
                     if 'rejection_reason' in broker_response:
                         order.rejection_reason = broker_response['rejection_reason']
-                else:
+                    print(f"   ❌ Order REJECTED by broker: {order.rejection_reason}")
+                elif broker_status == 'PENDING':
+                    # Order is pending, mark as submitted since it's in the broker's system
                     order.status = OrderStatus.SUBMITTED
                     order.submitted_at = datetime.utcnow()
+                    print(f"   ✅ Order PENDING/SUBMITTED at {order.submitted_at}")
+                else:
+                    # SUBMITTED or other valid status
+                    order.status = OrderStatus.SUBMITTED
+                    order.submitted_at = datetime.utcnow()
+                    print(f"   ✅ Order SUBMITTED at {order.submitted_at}")
             except Exception as e:
                 order.status = OrderStatus.REJECTED
                 order.rejection_reason = str(e)
-                print(f"Broker submission failed: {e}")
+                print(f"   ❌ Broker submission exception: {e}")
         else:
+            print(f"   ⚠️  No broker - simulating submission")
             # No broker - simulate submission
             order.status = OrderStatus.SUBMITTED
             order.submitted_at = datetime.utcnow()
         
         # Store in database
+        print(f"   💾 Saving to database...")
         self._save_order_to_db(order, user_id)
+        print(f"   ✅ Saved to database")
         
         # Cache order
         order_id = order.broker_order_id or f"local_{len(self.orders)}"
         self.orders[order_id] = order
+        print(f"   📝 Cached order with ID: {order_id}")
         
+        print(f"✅ OMS.create_order returning: status={order.status.value}, broker_id={order.broker_order_id}")
         return order
     
     def cancel_order(self, order_id: str) -> bool:

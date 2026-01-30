@@ -15,9 +15,45 @@ try:
     from ib_insync import IB, MarketOrder, LimitOrder, StopOrder, StopLimitOrder, util
     from ib_insync.contract import Stock
     IBKR_AVAILABLE = True
+    
+    # Start event loop for Streamlit compatibility
+    # This must be done at module level before any IB operations
+    _loop_started_global = False
+    def _start_global_event_loop():
+        """Start event loop once at module level for Streamlit compatibility"""
+        global _loop_started_global
+        if not _loop_started_global:
+            try:
+                # Check if event loop already exists
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_closed():
+                        raise RuntimeError("Event loop is closed")
+                except RuntimeError:
+                    # No event loop - start one using ib-insync's utility
+                    util.startLoop()
+                    _loop_started_global = True
+            except Exception as e:
+                # If startLoop fails, try creating a new event loop
+                try:
+                    import threading
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    def run_loop():
+                        asyncio.set_event_loop(loop)
+                        loop.run_forever()
+                    thread = threading.Thread(target=run_loop, daemon=True)
+                    thread.start()
+                    _loop_started_global = True
+                except Exception:
+                    pass
+    
 except ImportError:
     IBKR_AVAILABLE = False
     Stock = None  # For type hints when not available
+    _loop_started_global = False
+    def _start_global_event_loop():
+        pass
 
 
 class IBKRBroker:
@@ -35,49 +71,32 @@ class IBKRBroker:
         if not IBKR_AVAILABLE:
             raise ImportError("ib_insync not installed. Install with: pip install ib_insync")
         
+        # CRITICAL: Start event loop BEFORE creating IB instance
+        # This must happen before any IB operations
+        _start_global_event_loop()
+        
         self.host = host or os.getenv('IBKR_HOST', '127.0.0.1')
         self.port = port or int(os.getenv('IBKR_PORT', '7497'))  # 7497 = paper, 7496 = live
         self.client_id = client_id or int(os.getenv('IBKR_CLIENT_ID', '1'))
         
-        # Initialize IB instance
+        # Initialize IB instance (after event loop is started)
         self.ib = IB()
         self._connected = False
-        self._loop_started = False
-        
-        # Start event loop for this thread (required for ib-insync in Streamlit)
-        self._ensure_event_loop()
         
         # Connect to TWS/IB Gateway (lazy connection - only when needed)
         # Don't connect in __init__ to avoid blocking Streamlit
     
     def _ensure_event_loop(self):
         """Ensure event loop exists in current thread"""
+        # Event loop should already be started at module level
+        # This is just a safety check
         try:
-            # Try to get current event loop
             loop = asyncio.get_event_loop()
             if loop.is_closed():
                 raise RuntimeError("Event loop is closed")
         except RuntimeError:
-            # No event loop in this thread - create one
-            try:
-                # Start the event loop in a separate thread
-                if not self._loop_started:
-                    util.startLoop()  # This starts the event loop for ib-insync
-                    self._loop_started = True
-            except Exception as e:
-                # If startLoop fails, try creating a new event loop
-                try:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    # Start loop in background thread
-                    def run_loop():
-                        asyncio.set_event_loop(loop)
-                        loop.run_forever()
-                    thread = threading.Thread(target=run_loop, daemon=True)
-                    thread.start()
-                    self._loop_started = True
-                except Exception as e2:
-                    print(f"Warning: Could not start event loop: {e2}")
+            # Try to start it again if somehow it's not running
+            _start_global_event_loop()
     
     def _connect(self):
         """Connect to TWS/IB Gateway"""

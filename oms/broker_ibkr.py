@@ -5,6 +5,8 @@ Requires ib_insync library and TWS/IB Gateway to be running
 """
 
 import os
+import asyncio
+import threading
 from typing import Dict, Optional, List
 from datetime import datetime
 from .oms import Order, OrderStatus, OrderType
@@ -40,14 +42,51 @@ class IBKRBroker:
         # Initialize IB instance
         self.ib = IB()
         self._connected = False
+        self._loop_started = False
         
-        # Connect to TWS/IB Gateway
-        self._connect()
+        # Start event loop for this thread (required for ib-insync in Streamlit)
+        self._ensure_event_loop()
+        
+        # Connect to TWS/IB Gateway (lazy connection - only when needed)
+        # Don't connect in __init__ to avoid blocking Streamlit
+    
+    def _ensure_event_loop(self):
+        """Ensure event loop exists in current thread"""
+        try:
+            # Try to get current event loop
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                raise RuntimeError("Event loop is closed")
+        except RuntimeError:
+            # No event loop in this thread - create one
+            try:
+                # Start the event loop in a separate thread
+                if not self._loop_started:
+                    util.startLoop()  # This starts the event loop for ib-insync
+                    self._loop_started = True
+            except Exception as e:
+                # If startLoop fails, try creating a new event loop
+                try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    # Start loop in background thread
+                    def run_loop():
+                        asyncio.set_event_loop(loop)
+                        loop.run_forever()
+                    thread = threading.Thread(target=run_loop, daemon=True)
+                    thread.start()
+                    self._loop_started = True
+                except Exception as e2:
+                    print(f"Warning: Could not start event loop: {e2}")
     
     def _connect(self):
         """Connect to TWS/IB Gateway"""
         try:
+            # Ensure event loop is running
+            self._ensure_event_loop()
+            
             if not self.ib.isConnected():
+                # Use run() wrapper for async operations
                 self.ib.connect(
                     host=self.host,
                     port=self.port,
@@ -63,12 +102,21 @@ class IBKRBroker:
                 f"Make sure TWS or IB Gateway is running and API connections are enabled. "
                 f"Error: {str(e)}"
             )
+            # Don't raise immediately - allow lazy connection
+            print(f"⚠️ {error_msg}")
             raise ConnectionError(error_msg)
     
     def _ensure_connected(self):
         """Ensure connection is active, reconnect if needed"""
-        if not self.ib.isConnected():
-            self._connect()
+        try:
+            # Ensure event loop is running
+            self._ensure_event_loop()
+            
+            if not self.ib.isConnected():
+                self._connect()
+        except Exception as e:
+            print(f"Connection check failed: {e}")
+            raise
     
     def _create_contract(self, symbol: str, exchange: str = 'SMART', currency: str = 'USD'):
         """
@@ -79,6 +127,9 @@ class IBKRBroker:
             exchange: Exchange (default: 'SMART' for smart routing)
             currency: Currency (default: 'USD')
         """
+        # Ensure event loop is running
+        self._ensure_event_loop()
+        
         contract = Stock(symbol, exchange, currency)
         # Qualify contract to get full details
         qualified = self.ib.qualifyContracts(contract)
@@ -135,6 +186,8 @@ class IBKRBroker:
     def submit_order(self, order: Order) -> Dict:
         """Submit order to IBKR"""
         try:
+            # Ensure event loop is running
+            self._ensure_event_loop()
             self._ensure_connected()
             
             # Create contract
@@ -173,12 +226,16 @@ class IBKRBroker:
                 error_msg = f"Not connected to TWS/Gateway. {error_msg}"
             elif 'contract' in error_msg.lower():
                 error_msg = f"Invalid contract for symbol {order.symbol}. {error_msg}"
+            elif 'event loop' in error_msg.lower() or 'no current event loop' in error_msg.lower():
+                error_msg = f"Event loop issue. Try restarting the app. {error_msg}"
             
             raise Exception(f"IBKR order submission failed: {error_msg}")
     
     def cancel_order(self, order_id: str) -> bool:
         """Cancel order"""
         try:
+            # Ensure event loop is running
+            self._ensure_event_loop()
             self._ensure_connected()
             
             # Find the trade by order ID
@@ -199,6 +256,8 @@ class IBKRBroker:
     def get_order_status(self, order_id: str) -> Dict:
         """Get order status from IBKR"""
         try:
+            # Ensure event loop is running
+            self._ensure_event_loop()
             self._ensure_connected()
             
             # Find the trade by order ID
@@ -221,6 +280,8 @@ class IBKRBroker:
     def get_positions(self) -> List[Dict]:
         """Get current positions"""
         try:
+            # Ensure event loop is running
+            self._ensure_event_loop()
             self._ensure_connected()
             
             positions = []
@@ -246,12 +307,18 @@ class IBKRBroker:
             return positions
             
         except Exception as e:
-            print(f"Failed to get positions: {e}")
+            error_msg = str(e)
+            if 'event loop' in error_msg.lower() or 'no current event loop' in error_msg.lower():
+                print(f"⚠️ Event loop issue: {e}. Try restarting the app.")
+            else:
+                print(f"Failed to get positions: {e}")
             return []
     
     def get_account_info(self) -> Dict:
         """Get account information"""
         try:
+            # Ensure event loop is running
+            self._ensure_event_loop()
             self._ensure_connected()
             
             # Get account values
@@ -283,7 +350,11 @@ class IBKRBroker:
             return info
             
         except Exception as e:
-            print(f"Failed to get account info: {e}")
+            error_msg = str(e)
+            if 'event loop' in error_msg.lower() or 'no current event loop' in error_msg.lower():
+                print(f"⚠️ Event loop issue: {e}. Try restarting the app.")
+            else:
+                print(f"Failed to get account info: {e}")
             return {}
     
     def disconnect(self):

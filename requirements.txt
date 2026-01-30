@@ -48,3 +48,6 @@ docker>=6.1.0
 # MFA & Security
 pyotp>=2.9.0
 qrcode>=7.4.0
+
+# Interactive Brokers
+ib-insync>=0.9.86

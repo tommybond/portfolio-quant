@@ -130,12 +130,32 @@ class IBKRBroker:
         """
         Create a contract for the given symbol.
         For common US stocks, we can use the contract directly without qualification.
+        For Indian stocks (.NS/.BO), we use NSE/BSE exchange and INR currency.
         """
         self._ensure_event_loop()
-        contract = Stock(symbol, exchange, currency)
+        
+        # Detect Indian stocks and adjust exchange/currency
+        if symbol.endswith('.NS'):
+            # NSE (National Stock Exchange of India)
+            clean_symbol = symbol.replace('.NS', '')
+            exchange = 'NSE'
+            currency = 'INR'
+            print(f"      Detected NSE stock: {symbol} -> {clean_symbol}")
+            contract = Stock(clean_symbol, exchange, currency)
+        elif symbol.endswith('.BO'):
+            # BSE (Bombay Stock Exchange)
+            clean_symbol = symbol.replace('.BO', '')
+            exchange = 'BSE'
+            currency = 'INR'
+            print(f"      Detected BSE stock: {symbol} -> {clean_symbol}")
+            contract = Stock(clean_symbol, exchange, currency)
+        else:
+            # US or other stocks - use SMART routing
+            contract = Stock(symbol, exchange, currency)
+        
         print(f"      Created Stock contract: {contract}")
         
-        # Skip qualification for now - IBKR can handle unqualified contracts for most US stocks
+        # Skip qualification for now - IBKR can handle unqualified contracts for most stocks
         # qualifyContracts can hang in Streamlit environments
         print(f"      ✅ Returning contract (skipping qualification to avoid hang)")
         return contract
@@ -294,6 +314,45 @@ class IBKRBroker:
             print(f"Failed to get order status: {e}")
             return {}
 
+    def get_orders(self) -> List[Dict]:
+        """Get all open orders with proper symbol formatting for Indian stocks"""
+        try:
+            self._ensure_event_loop()
+            self._ensure_connected()
+
+            orders_list = []
+            for trade in self.ib.openTrades():
+                contract = trade.contract
+                order = trade.order
+                status = trade.orderStatus
+                
+                # Reconstruct symbol with exchange suffix for Indian stocks
+                symbol = contract.symbol
+                if hasattr(contract, 'exchange'):
+                    if contract.exchange == 'NSE':
+                        symbol = f"{contract.symbol}.NS"
+                    elif contract.exchange == 'BSE':
+                        symbol = f"{contract.symbol}.BO"
+                
+                orders_list.append({
+                    'order_id': str(order.orderId),
+                    'symbol': symbol,
+                    'side': order.action,
+                    'quantity': int(order.totalQuantity),
+                    'order_type': order.orderType,
+                    'status': status.status,
+                    'filled_quantity': int(status.filled) if status.filled else 0,
+                    'remaining_quantity': int(status.remaining) if status.remaining else int(order.totalQuantity),
+                    'average_fill_price': float(status.avgFillPrice) if status.avgFillPrice else None,
+                    'submitted_at': None  # IBKR doesn't provide submission time in this API
+                })
+            
+            return orders_list
+
+        except Exception as e:
+            print(f"Failed to get orders: {e}")
+            return []
+
     def _convert_status(self, ib_status: str) -> str:
         """Convert IBKR order status to OMS standard status"""
         status_map = {
@@ -337,6 +396,14 @@ class IBKRBroker:
                     # Get contract details
                     contract = position.contract
 
+                    # Reconstruct symbol with exchange suffix for Indian stocks
+                    symbol = contract.symbol
+                    if hasattr(contract, 'exchange'):
+                        if contract.exchange == 'NSE':
+                            symbol = f"{contract.symbol}.NS"
+                        elif contract.exchange == 'BSE':
+                            symbol = f"{contract.symbol}.BO"
+
                     # Get current market price with NaN checking
                     import math
                     ticker = self.ib.reqMktData(contract, '', False, False)
@@ -359,7 +426,7 @@ class IBKRBroker:
                     self.ib.cancelMktData(contract)
 
                     positions.append({
-                        'symbol': contract.symbol,
+                        'symbol': symbol,  # Use reconstructed symbol with exchange suffix
                         'quantity': int(position.position),
                         'average_price': float(position.avgCost) if position.avgCost else 0.0,
                         'current_price': current_price,

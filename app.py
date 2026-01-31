@@ -7605,7 +7605,8 @@ if tab_deployment:
                                 if pos.symbol == ticker_deploy:
                                     current_price = float(pos.current_price)
                                     if current_price > 0:
-                                        st.metric("Current Price", f"${current_price:.2f}")
+                                        currency_symbol = get_currency_symbol(ticker_deploy)
+                                        st.metric("Current Price", f"{currency_symbol}{current_price:.2f}")
                                         st.caption(f"💰 Live price from {selected_broker_deploy} broker (from position)")
                                         break
                         elif selected_broker_deploy == 'IBKR':
@@ -7615,7 +7616,8 @@ if tab_deployment:
                                     # Only use position price if it's valid (> 0)
                                     if pos['current_price'] > 0:
                                         current_price = pos['current_price']
-                                        st.metric("Current Price", f"${current_price:.2f}")
+                                        currency_symbol = get_currency_symbol(ticker_deploy)
+                                        st.metric("Current Price", f"{currency_symbol}{current_price:.2f}")
                                         st.caption(f"💰 Live price from {selected_broker_deploy} broker (from position)")
                                         break
                     except Exception as e:
@@ -7650,7 +7652,8 @@ if tab_deployment:
                             
                             if bars_df is not None and not bars_df.empty:
                                 current_price = float(bars_df['close'].iloc[-1])
-                                st.metric("Current Price", f"${current_price:.2f}")
+                                currency_symbol = get_currency_symbol(ticker_deploy)
+                                st.metric("Current Price", f"{currency_symbol}{current_price:.2f}")
                                 st.caption(f"💰 Live price from {selected_broker_deploy} broker (1-minute bar)")
                     except Exception as e:
                         pass
@@ -7662,7 +7665,8 @@ if tab_deployment:
                                 trade = broker_instance.api.get_latest_trade(ticker_deploy)
                                 if trade:
                                     current_price = float(trade.p) if hasattr(trade, 'p') else float(trade.price)
-                                    st.metric("Current Price", f"${current_price:.2f}")
+                                    currency_symbol = get_currency_symbol(ticker_deploy)
+                                    st.metric("Current Price", f"{currency_symbol}{current_price:.2f}")
                                     st.caption(f"💰 Live price from {selected_broker_deploy} broker (latest trade)")
                         except Exception as e:
                             pass
@@ -7680,7 +7684,8 @@ if tab_deployment:
                             # Check for NaN
                             if pd.notna(price_val) and not np.isnan(price_val):
                                 current_price = float(price_val)
-                                st.metric("Current Price", f"${current_price:.2f}")
+                                currency_symbol = get_currency_symbol(ticker_deploy)
+                                st.metric("Current Price", f"{currency_symbol}{current_price:.2f}")
                                 st.caption("📈 Using yfinance (may be delayed 15-20 min)")
                         
                         if current_price is None:
@@ -7690,7 +7695,8 @@ if tab_deployment:
                                 price_val = hist_daily['Close'].iloc[-1]
                                 if pd.notna(price_val) and not np.isnan(price_val):
                                     current_price = float(price_val)
-                                    st.metric("Current Price", f"${current_price:.2f}")
+                                    currency_symbol = get_currency_symbol(ticker_deploy)
+                                    st.metric("Current Price", f"{currency_symbol}{current_price:.2f}")
                                     st.caption("📈 Using yfinance daily close")
                         
                         if current_price is None:
@@ -7700,13 +7706,15 @@ if tab_deployment:
                                 price_val = info.get('currentPrice')
                                 if price_val and not np.isnan(price_val):
                                     current_price = float(price_val)
-                                    st.metric("Current Price", f"${current_price:.2f}")
+                                    currency_symbol = get_currency_symbol(ticker_deploy)
+                                    st.metric("Current Price", f"{currency_symbol}{current_price:.2f}")
                                     st.caption("📈 Using yfinance info")
                             elif 'regularMarketPrice' in info and info.get('regularMarketPrice'):
                                 price_val = info.get('regularMarketPrice')
                                 if price_val and not np.isnan(price_val):
                                     current_price = float(price_val)
-                                    st.metric("Current Price", f"${current_price:.2f}")
+                                    currency_symbol = get_currency_symbol(ticker_deploy)
+                                    st.metric("Current Price", f"{currency_symbol}{current_price:.2f}")
                                     st.caption("📈 Using yfinance market price")
                     except Exception as e:
                         st.error(f"❌ Could not fetch price: {str(e)}")
@@ -7723,7 +7731,8 @@ if tab_deployment:
                             bid = float(info['bid'])
                             ask = float(info['ask'])
                             spread = ask - bid
-                            st.caption(f"Bid: ${bid:.2f} | Ask: ${ask:.2f} | Spread: ${spread:.2f}")
+                            currency_symbol = get_currency_symbol(ticker_deploy)
+                            st.caption(f"Bid: {currency_symbol}{bid:.2f} | Ask: {currency_symbol}{ask:.2f} | Spread: {currency_symbol}{spread:.2f}")
                     except:
                         pass
                 
@@ -8024,14 +8033,17 @@ if tab_deployment:
                             current_price_val, fixed_stop, trailing_stop, dist_to_fixed, dist_to_trailing
                         )
                         
+                        # Get currency symbol for this ticker
+                        currency_symbol = get_currency_symbol(symbol)
+                        
                         # Format stop loss values
                         if fixed_stop:
-                            fixed_stop_str = f"${fixed_stop:.2f}"
+                            fixed_stop_str = f"{currency_symbol}{fixed_stop:.2f}"
                         else:
                             fixed_stop_str = "N/A"
                         
                         if trailing_stop:
-                            trailing_stop_str = f"${trailing_stop:.2f}"
+                            trailing_stop_str = f"{currency_symbol}{trailing_stop:.2f}"
                         else:
                             trailing_stop_str = "N/A"
                         
@@ -8041,17 +8053,17 @@ if tab_deployment:
                         pnl_percentage = (unrealized_pnl_val / cost_basis * 100) if cost_basis > 0 else 0.0
                         
                         # Format P&L with percentage (show + sign for gains, - for losses)
-                        pnl_display = f"${unrealized_pnl_val:+,.2f}"
+                        pnl_display = f"{currency_symbol}{unrealized_pnl_val:+,.2f}"
                         pnl_pct_display = f"{pnl_percentage:+.2f}%"
                         
                         positions_data.append({
                             'Symbol': symbol,
                             'Quantity': int(float(pos.qty)),
-                            'Avg Entry': f"${avg_entry_val:.2f}",
-                            'Current Price': f"${current_price_val:.2f}",
+                            'Avg Entry': f"{currency_symbol}{avg_entry_val:.2f}",
+                            'Current Price': f"{currency_symbol}{current_price_val:.2f}",
                             'Unrealized P&L': pnl_display,
                             'P&L %': pnl_pct_display,
-                            'Market Value': f"${float(pos.market_value):.2f}",
+                            'Market Value': f"{currency_symbol}{float(pos.market_value):.2f}",
                             'Trend Strength': trend_strength,
                             'Pull Back': pullback,
                             'Buy on Dip': buy_on_dip,
@@ -8345,7 +8357,8 @@ if tab_deployment:
                     elif deploy_current_price is None:
                         st.error("❌ Price not available. Please wait for price to load or try a different ticker.")
                     elif deploy_current_price <= 0:
-                        st.error(f"❌ Invalid price: ${deploy_current_price}. The price fetching may have failed. Please refresh or try again.")
+                        currency_symbol = get_currency_symbol(ticker_deploy)
+                        st.error(f"❌ Invalid price: {currency_symbol}{deploy_current_price}. The price fetching may have failed. Please refresh or try again.")
         
         # Display Prepared Orders
         if st.session_state.prepared_orders:
@@ -8369,15 +8382,18 @@ if tab_deployment:
             # Display orders table
             orders_df_data = []
             total_value = 0
+            # Get currency symbol from first order's ticker
+            currency_symbol = get_currency_symbol(st.session_state.prepared_orders[0]['symbol']) if st.session_state.prepared_orders else '$'
+            
             for order in st.session_state.prepared_orders:
                 orders_df_data.append({
                     'Trench': order['trench'],
                     'Action': order['action'],
                     'Symbol': order['symbol'],
                     'Quantity': order['quantity'],
-                    'Price': f"${order['price']:.2f}",
+                    'Price': f"{currency_symbol}{order['price']:.2f}",
                     'Order Type': order['order_type'],
-                    'Total Value': f"${order['total_value']:,.2f}",
+                    'Total Value': f"{currency_symbol}{order['total_value']:,.2f}",
                     'Reason': order['reason']
                 })
                 total_value += order['total_value']
@@ -8385,7 +8401,7 @@ if tab_deployment:
             orders_df = pd.DataFrame(orders_df_data)
             st.dataframe(orders_df, hide_index=True)
             
-            st.info(f"💰 **Total Order Value**: ${total_value:,.2f}")
+            st.info(f"💰 **Total Order Value**: {currency_symbol}{total_value:,.2f}")
             
             # Execute button section
             st.markdown("---")
@@ -8509,27 +8525,28 @@ if tab_deployment:
                             
                             # Show detailed rejection info
                             with st.expander(f"🔍 Rejection Details for Trench {order['trench']}"):
+                                currency_symbol = get_currency_symbol(order['symbol'])
                                 st.markdown(f"""
                                 **Order Details:**
                                 - Symbol: {order['symbol']}
                                 - Quantity: {order['quantity']} shares
                                 - Order Type: {order['order_type']}
-                                - Price: ${order['price']:.2f}
+                                - Price: {currency_symbol}{order['price']:.2f}
                                 - Status: {order_status}
                                 """)
                                 if rejection_reason:
                                     st.markdown(f"**Rejection Reason:** {rejection_reason}")
                                 
-                                st.markdown("""
+                                st.markdown(f"""
                                 **Common Alpaca Rejection Reasons:**
-                                - **Insufficient Buying Power**: Not enough cash (need ${order['total_value']:.2f})
+                                - **Insufficient Buying Power**: Not enough cash (need {currency_symbol}{order['total_value']:.2f})
                                 - **Invalid Symbol**: Ticker not recognized
                                 - **Market Closed**: Market orders only work during market hours
                                 - **Price Too Far**: Limit price too far from market (use market order instead)
                                 - **Fractional Shares**: Quantity must be whole number
                                 
                                 **Quick Fixes:**
-                                1. Check buying power: Ensure you have at least ${order['total_value']:.2f} available
+                                1. Check buying power: Ensure you have at least {currency_symbol}{order['total_value']:.2f} available
                                 2. Use MARKET order instead of LIMIT if market is open
                                 3. Verify symbol: {order['symbol']} is tradeable
                                 4. Check market hours: Market orders only work 9:30 AM - 4:00 PM ET
@@ -8558,8 +8575,9 @@ if tab_deployment:
                             })
                         else:
                             failed_count += 1
+                            currency_symbol = get_currency_symbol(order['symbol'])
                             st.error(f"❌ Trench {order['trench']}: Unexpected order status '{order_status}' (expected SUBMITTED)")
-                            st.info(f"Order details: Symbol={order['symbol']}, Qty={order['quantity']}, Type={order['order_type']}, Price=${order['price']:.2f}")
+                            st.info(f"Order details: Symbol={order['symbol']}, Qty={order['quantity']}, Type={order['order_type']}, Price={currency_symbol}{order['price']:.2f}")
                     except Exception as e:
                         failed_count += 1
                         import traceback

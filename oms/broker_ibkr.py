@@ -4,194 +4,198 @@ Handles order submission and management via IBKR TWS/IB Gateway API
 Requires ib_insync library and TWS/IB Gateway to be running
 """
 
+from __future__ import annotations
+
 import os
 import asyncio
-import threading
-from typing import Dict, Optional, List
+import random
 from datetime import datetime
-from .oms import Order, OrderStatus, OrderType
+from typing import Dict, List, Optional
 
+# Import OrderType from oms module for type checking
 try:
-    from ib_insync import IB, MarketOrder, LimitOrder, StopOrder, StopLimitOrder, util
-    from ib_insync.contract import Stock
-    IBKR_AVAILABLE = True
-    
-    # Start event loop for Streamlit compatibility
-    # This must be done at module level before any IB operations
-    _loop_started_global = False
-    def _start_global_event_loop():
-        """Start event loop once at module level for Streamlit compatibility"""
-        global _loop_started_global
-        if not _loop_started_global:
-            try:
-                # Check if event loop already exists
-                try:
-                    loop = asyncio.get_event_loop()
-                    if loop.is_closed():
-                        raise RuntimeError("Event loop is closed")
-                except RuntimeError:
-                    # No event loop - start one using ib-insync's utility
-                    util.startLoop()
-                    _loop_started_global = True
-            except Exception as e:
-                # If startLoop fails, try creating a new event loop
-                try:
-                    import threading
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    def run_loop():
-                        asyncio.set_event_loop(loop)
-                        loop.run_forever()
-                    thread = threading.Thread(target=run_loop, daemon=True)
-                    thread.start()
-                    _loop_started_global = True
-                except Exception:
-                    pass
-    
+    from oms.oms import OrderType
 except ImportError:
-    IBKR_AVAILABLE = False
-    Stock = None  # For type hints when not available
-    _loop_started_global = False
-    def _start_global_event_loop():
-        pass
+    # Fallback if circular import - will be available at runtime
+    OrderType = None
+
+# Ensure an asyncio event loop exists for this thread
+def _ensure_event_loop():
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+_ib_ready = False
+def _import_ib_insync():
+    global _ib_ready, IB, Stock, MarketOrder, LimitOrder, StopOrder, StopLimitOrder, util
+    if _ib_ready:
+        return
+    _ensure_event_loop()
+    # local import to avoid import-time event-loop side effects
+    from ib_insync import IB, Stock, MarketOrder, LimitOrder, StopOrder, StopLimitOrder, util
+    _ib_ready = True
 
 
 class IBKRBroker:
-    """Interactive Brokers broker integration"""
-    
-    def __init__(self, host: str = None, port: int = None, client_id: int = None):
-        """
-        Initialize IBKR connection
-        
-        Args:
-            host: TWS/IB Gateway host (default: 127.0.0.1)
-            port: TWS/IB Gateway port (default: 7497 for paper, 7496 for live)
-            client_id: Client ID (default: 1)
-        """
-        if not IBKR_AVAILABLE:
-            raise ImportError("ib_insync not installed. Install with: pip install ib_insync")
-        
-        # CRITICAL: Start event loop BEFORE creating IB instance
-        # This must happen before any IB operations
-        _start_global_event_loop()
-        
-        self.host = host or os.getenv('IBKR_HOST', '127.0.0.1')
-        self.port = port or int(os.getenv('IBKR_PORT', '7497'))  # 7497 = paper, 7496 = live
-        self.client_id = client_id or int(os.getenv('IBKR_CLIENT_ID', '1'))
-        
-        # Initialize IB instance (after event loop is started)
-        self.ib = IB()
-        self._connected = False
-        
-        # Connect to TWS/IB Gateway (lazy connection - only when needed)
-        # Don't connect in __init__ to avoid blocking Streamlit
-    
+    """Interactive Brokers broker integration — Streamlit/ib_insync safe."""
+
     def _ensure_event_loop(self):
-        """Ensure event loop exists in current thread"""
-        # Event loop should already be started at module level
-        # This is just a safety check
+        """Instance helper that ensures a loop exists for this thread."""
+        _ensure_event_loop()
+
+    def __init__(
+        self,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
+        client_id: Optional[int] = None,
+        username: Optional[str] = None,
+        timeout: float = 5.0,
+        auto_connect: bool = False,
+        *args,
+        **kwargs,
+    ):
+        """
+        Initialize IBKR broker without forcing immediate connect.
+        - client_id: if None, a random client id is chosen to avoid collisions.
+        - auto_connect: if True, will attempt to connect during init.
+        """
+        # lazy import ib_insync types
+        _import_ib_insync()
+
+        self.host = host or os.getenv("IBKR_HOST", "127.0.0.1")
+        self.port = int(port or os.getenv("IBKR_PORT", "4002"))
+        # choose a random client id when not provided to avoid duplicate-client errors
+        if client_id is None:
+            # reserve low ids for interactive/manual sessions; pick a high random id
+            self.client_id = int(os.getenv("IBKR_CLIENT_ID") or random.randint(2000, 65000))
+        else:
+            self.client_id = client_id
+        self.username = username or os.getenv("IBKR_USERNAME")
+        self.timeout = timeout
+
+        # IB instance created here (safe because _import_ib_insync called)
+        self.ib = IB()
+        self.connected = False
+        self._last_connect_error: Optional[Exception] = None
+
+        if auto_connect:
+            try:
+                self.connect()
+            except Exception as e:
+                # record error, but do not raise during import-time usage
+                self._last_connect_error = e
+
+    def connect(self, timeout: Optional[float] = None, readonly: bool = False) -> bool:
+        """Connect to TWS/IB Gateway. Returns True on success."""
+        self._ensure_event_loop()
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_closed():
-                raise RuntimeError("Event loop is closed")
-        except RuntimeError:
-            # Try to start it again if somehow it's not running
-            _start_global_event_loop()
-    
-    def _connect(self):
-        """Connect to TWS/IB Gateway"""
-        try:
-            # Ensure event loop is running
-            self._ensure_event_loop()
-            
-            if not self.ib.isConnected():
-                # Use run() wrapper for async operations
-                self.ib.connect(
-                    host=self.host,
-                    port=self.port,
-                    clientId=self.client_id,
-                    readonly=False
-                )
-                self._connected = True
-                print(f"✅ Connected to IBKR TWS/Gateway at {self.host}:{self.port}")
-        except Exception as e:
-            self._connected = False
-            error_msg = (
-                f"Failed to connect to IBKR TWS/Gateway at {self.host}:{self.port}. "
-                f"Make sure TWS or IB Gateway is running and API connections are enabled. "
-                f"Error: {str(e)}"
+            if self.ib.isConnected():
+                self.connected = True
+                return True
+
+            self.ib.connect(
+                host=self.host,
+                port=self.port,
+                clientId=self.client_id,
+                timeout=timeout or self.timeout,
+                readonly=readonly,
             )
-            # Don't raise immediately - allow lazy connection
-            print(f"⚠️ {error_msg}")
-            raise ConnectionError(error_msg)
-    
-    def _ensure_connected(self):
-        """Ensure connection is active, reconnect if needed"""
-        try:
-            # Ensure event loop is running
-            self._ensure_event_loop()
-            
-            if not self.ib.isConnected():
-                self._connect()
+            self.connected = self.ib.isConnected()
+            if not self.connected:
+                raise ConnectionError(f"Could not connect to IB at {self.host}:{self.port} (clientId={self.client_id})")
+            return True
         except Exception as e:
-            print(f"Connection check failed: {e}")
+            self.connected = False
+            self._last_connect_error = e
             raise
-    
+
+    def disconnect(self):
+        """Disconnect the IB session if connected."""
+        try:
+            if hasattr(self, "ib") and self.ib.isConnected():
+                self.ib.disconnect()
+            self.connected = False
+        except Exception:
+            self.connected = False
+
+    def _ensure_connected(self):
+        """Ensure an active connection, attempt reconnect if necessary."""
+        self._ensure_event_loop()
+        if not self.ib.isConnected():
+            self.connect()
+
     def _create_contract(self, symbol: str, exchange: str = 'SMART', currency: str = 'USD'):
         """
-        Create IBKR contract from symbol
-        
-        Args:
-            symbol: Stock symbol (e.g., 'AAPL')
-            exchange: Exchange (default: 'SMART' for smart routing)
-            currency: Currency (default: 'USD')
+        Create a contract for the given symbol.
+        For common US stocks, we can use the contract directly without qualification.
+        For Indian stocks (.NS/.BO), we use NSE/BSE exchange and INR currency.
         """
-        # Ensure event loop is running
         self._ensure_event_loop()
         
-        contract = Stock(symbol, exchange, currency)
-        # Qualify contract to get full details
-        qualified = self.ib.qualifyContracts(contract)
-        if qualified:
-            return qualified[0]
+        # Detect Indian stocks and adjust exchange/currency
+        if symbol.endswith('.NS'):
+            # NSE (National Stock Exchange of India)
+            clean_symbol = symbol.replace('.NS', '')
+            exchange = 'NSE'
+            currency = 'INR'
+            print(f"      Detected NSE stock: {symbol} -> {clean_symbol}")
+            contract = Stock(clean_symbol, exchange, currency)
+        elif symbol.endswith('.BO'):
+            # BSE (Bombay Stock Exchange)
+            clean_symbol = symbol.replace('.BO', '')
+            exchange = 'BSE'
+            currency = 'INR'
+            print(f"      Detected BSE stock: {symbol} -> {clean_symbol}")
+            contract = Stock(clean_symbol, exchange, currency)
+        else:
+            # US or other stocks - use SMART routing
+            contract = Stock(symbol, exchange, currency)
+        
+        print(f"      Created Stock contract: {contract}")
+        
+        # Skip qualification for now - IBKR can handle unqualified contracts for most stocks
+        # qualifyContracts can hang in Streamlit environments
+        print(f"      ✅ Returning contract (skipping qualification to avoid hang)")
         return contract
-    
-    def _convert_order_type(self, order: Order) -> object:
+
+    def _convert_order_type(self, order: "Order") -> object:
         """
         Convert Order to IBKR order type
-        
+
         Args:
             order: Order object
-            
+
         Returns:
             IBKR order object (MarketOrder, LimitOrder, etc.)
         """
         quantity = order.quantity
         if order.side.upper() == 'SELL':
             quantity = -abs(quantity)  # Negative for sell
-        
+
         if order.order_type == OrderType.MARKET:
             return MarketOrder('BUY' if quantity > 0 else 'SELL', abs(quantity))
-        
+
         elif order.order_type == OrderType.LIMIT:
             if not order.price:
                 raise ValueError("Limit order requires price")
             return LimitOrder('BUY' if quantity > 0 else 'SELL', abs(quantity), order.price)
-        
+
         elif order.order_type == OrderType.STOP:
             if not order.stop_price:
                 raise ValueError("Stop order requires stop_price")
             return StopOrder('BUY' if quantity > 0 else 'SELL', abs(quantity), order.stop_price)
-        
+
         elif order.order_type == OrderType.STOP_LIMIT:
             if not order.stop_price or not order.price:
                 raise ValueError("Stop-limit order requires both stop_price and price")
             return StopLimitOrder('BUY' if quantity > 0 else 'SELL', abs(quantity), order.price, order.stop_price)
-        
+
         else:
             # Default to market order
             return MarketOrder('BUY' if quantity > 0 else 'SELL', abs(quantity))
-    
+
     def _convert_time_in_force(self, tif: str) -> str:
         """Convert time_in_force to IBKR format"""
         mapping = {
@@ -201,86 +205,86 @@ class IBKRBroker:
             'FOK': 'FOK'   # Fill or Kill
         }
         return mapping.get(tif.upper(), 'DAY')
-    
-    def submit_order(self, order: Order) -> Dict:
+
+    def submit_order(self, order: "Order") -> Dict:
         """Submit order to IBKR"""
         try:
-            # Ensure event loop is running
+            print(f"🔵 IBKR submit_order called for {order.symbol} x{order.quantity}")
             self._ensure_event_loop()
+            print(f"   Event loop ensured")
             self._ensure_connected()
-            
-            # Create contract
+            print(f"   Connection ensured (connected={self.connected})")
+
+            print(f"   Creating contract for {order.symbol}...")
             contract = self._create_contract(order.symbol)
+            print(f"   ✅ Contract created: {contract}")
             
-            # Create IBKR order
+            print(f"   Converting order type {order.order_type}...")
             ib_order = self._convert_order_type(order)
+            print(f"   ✅ IB order created: {ib_order}")
+            
             ib_order.tif = self._convert_time_in_force(order.time_in_force)
-            
-            # Place order
+            print(f"   Time in force set to: {ib_order.tif}")
+
+            print(f"   📤 Placing order with IBKR...")
             trade = self.ib.placeOrder(contract, ib_order)
+            print(f"   ✅ Order placed! Trade object: {trade}")
             
-            # Wait for order acknowledgment (non-blocking check)
-            # Note: In production, you might want to use async/await for better handling
-            self.ib.sleep(0.1)  # Brief wait for order acknowledgment
-            
-            # Get order status
+            # Wait longer for IBKR to process and update order status
+            # Inactive -> PreSubmitted/Submitted transition takes time
+            self.ib.sleep(1.0)  # Increased from 0.1 to 1.0 seconds
+
             order_status = trade.orderStatus.status
+            print(f"   Order status from IBKR: {order_status}")
             
             result = {
                 'order_id': str(trade.order.orderId) if trade.order.orderId else None,
                 'status': self._convert_status(order_status),
                 'submitted_at': datetime.utcnow().isoformat()
             }
+            print(f"   📊 Result: {result}")
             
-            # Check for rejection
-            if order_status in ['Cancelled', 'Inactive', 'ApiCancelled']:
+            # Only treat explicitly cancelled orders as rejected
+            # Inactive status means order is pending, not rejected
+            if order_status in ['Cancelled', 'ApiCancelled']:
                 result['rejection_reason'] = f"Order {order_status}"
+                print(f"   ⚠️  Order has rejection status: {order_status}")
             
+            print(f"✅ IBKR submit_order returning successfully: {result}")
             return result
-            
+
         except Exception as e:
-            error_msg = str(e)
-            # Provide more context for common errors
-            if 'not connected' in error_msg.lower():
-                error_msg = f"Not connected to TWS/Gateway. {error_msg}"
-            elif 'contract' in error_msg.lower():
-                error_msg = f"Invalid contract for symbol {order.symbol}. {error_msg}"
-            elif 'event loop' in error_msg.lower() or 'no current event loop' in error_msg.lower():
-                error_msg = f"Event loop issue. Try restarting the app. {error_msg}"
-            
-            raise Exception(f"IBKR order submission failed: {error_msg}")
-    
+            msg = str(e)
+            if 'not connected' in msg.lower():
+                msg = f"Not connected to TWS/Gateway. {msg}"
+            print(f"❌ IBKR submit_order FAILED: {msg}")
+            raise Exception(f"IBKR order submission failed: {msg}")
+
     def cancel_order(self, order_id: str) -> bool:
         """Cancel order"""
         try:
-            # Ensure event loop is running
             self._ensure_event_loop()
             self._ensure_connected()
-            
-            # Find the trade by order ID
+
             for trade in self.ib.openTrades():
                 if str(trade.order.orderId) == str(order_id):
                     self.ib.cancelOrder(trade.order)
                     return True
-            
-            # If not found in open trades, try to cancel by order ID
-            # Note: This is a simplified approach. In production, you'd track orders better
-            print(f"Order {order_id} not found in open trades")
+
             return False
-            
+
         except Exception as e:
             print(f"Failed to cancel order {order_id}: {e}")
             return False
-    
+
     def get_order_status(self, order_id: str) -> Dict:
         """Get order status from IBKR"""
         try:
-            # Ensure event loop is running
             self._ensure_event_loop()
             self._ensure_connected()
-            
-            # Find the trade by order ID
-            for trade in self.ib.openTrades() + self.ib.filledOrders():
+
+            # Check open trades
+            for trade in self.ib.openTrades():
                 if str(trade.order.orderId) == str(order_id):
                     status = trade.orderStatus
                     return {
@@ -290,41 +294,149 @@ class IBKRBroker:
                         'remaining_quantity': int(status.remaining) if hasattr(status, 'remaining') else None
                     }
             
+            # Check filled trades
+            try:
+                for trade in self.ib.trades():
+                    if str(trade.order.orderId) == str(order_id):
+                        status = trade.orderStatus
+                        return {
+                            'status': self._convert_status(status.status),
+                            'filled_quantity': int(status.filled),
+                            'average_fill_price': float(status.avgFillPrice) if status.avgFillPrice else None,
+                            'remaining_quantity': int(status.remaining) if hasattr(status, 'remaining') else None
+                        }
+            except Exception:
+                pass  # trades() may not be available
+
             return {'status': 'NOT_FOUND'}
-            
+
         except Exception as e:
             print(f"Failed to get order status: {e}")
             return {}
-    
-    def get_positions(self) -> List[Dict]:
-        """Get current positions"""
+
+    def get_orders(self) -> List[Dict]:
+        """Get all open orders with proper symbol formatting for Indian stocks"""
         try:
-            # Ensure event loop is running
             self._ensure_event_loop()
             self._ensure_connected()
+
+            orders_list = []
+            for trade in self.ib.openTrades():
+                contract = trade.contract
+                order = trade.order
+                status = trade.orderStatus
+                
+                # Reconstruct symbol with exchange suffix for Indian stocks
+                symbol = contract.symbol
+                if hasattr(contract, 'exchange'):
+                    if contract.exchange == 'NSE':
+                        symbol = f"{contract.symbol}.NS"
+                    elif contract.exchange == 'BSE':
+                        symbol = f"{contract.symbol}.BO"
+                
+                orders_list.append({
+                    'order_id': str(order.orderId),
+                    'symbol': symbol,
+                    'side': order.action,
+                    'quantity': int(order.totalQuantity),
+                    'order_type': order.orderType,
+                    'status': status.status,
+                    'filled_quantity': int(status.filled) if status.filled else 0,
+                    'remaining_quantity': int(status.remaining) if status.remaining else int(order.totalQuantity),
+                    'average_fill_price': float(status.avgFillPrice) if status.avgFillPrice else None,
+                    'submitted_at': None  # IBKR doesn't provide submission time in this API
+                })
             
+            return orders_list
+
+        except Exception as e:
+            print(f"Failed to get orders: {e}")
+            return []
+
+    def _convert_status(self, ib_status: str) -> str:
+        """Convert IBKR order status to OMS standard status"""
+        status_map = {
+            'PendingSubmit': 'PENDING',
+            'PendingCancel': 'PENDING',
+            'PreSubmitted': 'PENDING',
+            'Submitted': 'SUBMITTED',
+            'ApiPending': 'PENDING',
+            'ApiCancelled': 'CANCELLED',
+            'Cancelled': 'CANCELLED',
+            'Filled': 'FILLED',
+            'Inactive': 'PENDING',  # Orders often start as Inactive before being Submitted
+        }
+        return status_map.get(ib_status, ib_status.upper())
+
+    def _get_default_account(self) -> Optional[str]:
+        """Return a default managed account or None."""
+        try:
+            self._ensure_event_loop()
+            accounts = self.ib.managedAccounts()
+            return accounts[0] if accounts else None
+        except Exception:
+            return None
+
+    def get_positions(self, account_id: Optional[str] = None) -> List[Dict]:
+        """Get current positions (optionally filtered by account)"""
+        try:
+            self._ensure_event_loop()
+            self._ensure_connected()
+
+            account_id = account_id or self._get_default_account()
+
             positions = []
             for position in self.ib.positions():
+                # If an account was specified, skip positions from other accounts
+                pos_account = getattr(position, "account", None)
+                if account_id and pos_account and pos_account != account_id:
+                    continue
+
                 if position.position != 0:  # Only non-zero positions
                     # Get contract details
                     contract = position.contract
-                    
-                    # Get current market price
+
+                    # Reconstruct symbol with exchange suffix for Indian stocks
+                    symbol = contract.symbol
+                    if hasattr(contract, 'exchange'):
+                        if contract.exchange == 'NSE':
+                            symbol = f"{contract.symbol}.NS"
+                        elif contract.exchange == 'BSE':
+                            symbol = f"{contract.symbol}.BO"
+
+                    # Get current market price with NaN checking
+                    import math
                     ticker = self.ib.reqMktData(contract, '', False, False)
                     self.ib.sleep(0.5)  # Wait for market data
-                    current_price = ticker.marketPrice() if ticker.marketPrice() else 0.0
                     
+                    # Check for valid price (not NaN, not None, greater than 0)
+                    market_price = ticker.marketPrice()
+                    if market_price and not math.isnan(market_price) and market_price > 0:
+                        current_price = float(market_price)
+                    else:
+                        # Try other price sources
+                        if ticker.last and not math.isnan(ticker.last) and ticker.last > 0:
+                            current_price = float(ticker.last)
+                        elif ticker.close and not math.isnan(ticker.close) and ticker.close > 0:
+                            current_price = float(ticker.close)
+                        else:
+                            current_price = 0.0
+                    
+                    # Clean up market data subscription
+                    self.ib.cancelMktData(contract)
+
                     positions.append({
-                        'symbol': contract.symbol,
+                        'symbol': symbol,  # Use reconstructed symbol with exchange suffix
                         'quantity': int(position.position),
                         'average_price': float(position.avgCost) if position.avgCost else 0.0,
                         'current_price': current_price,
                         'unrealized_pnl': float(position.unrealizedPNL) if hasattr(position, 'unrealizedPNL') else 0.0,
-                        'market_value': abs(float(position.position) * current_price) if current_price else 0.0
+                        'market_value': abs(float(position.position) * current_price) if current_price else 0.0,
+                        'account': pos_account
                     })
-            
+
             return positions
-            
+
         except Exception as e:
             error_msg = str(e)
             if 'event loop' in error_msg.lower() or 'no current event loop' in error_msg.lower():
@@ -332,23 +444,116 @@ class IBKRBroker:
             else:
                 print(f"Failed to get positions: {e}")
             return []
-    
-    def get_account_info(self) -> Dict:
-        """Get account information"""
+
+    def get_current_price(self, symbol: str, exchange: str = 'SMART', currency: str = 'USD') -> Optional[Dict]:
+        """Get current price for a symbol (works even without position)
+        
+        Returns dict with 'price', 'bid', 'ask', 'last' or None if unavailable
+        
+        Note: Paper trading accounts may not have realtime market data subscriptions.
+        This method will return None if no data is available, allowing fallback to yfinance.
+        """
         try:
-            # Ensure event loop is running
             self._ensure_event_loop()
             self._ensure_connected()
             
-            # Get account values
-            account_values = self.ib.accountValues()
+            # Create and qualify contract
+            contract = Stock(symbol, exchange, currency)
             
+            # Try to get delayed or real-time market data
+            # Using snapshot=True for delayed data if real-time unavailable
+            ticker = self.ib.reqMktData(contract, '', True, False)
+            self.ib.sleep(2.0)  # Wait longer for market data to arrive
+            
+            # Debug: check what we received
+            print(f"🔍 IBKR data for {symbol}: bid={ticker.bid}, ask={ticker.ask}, last={ticker.last}, close={ticker.close}")
+            
+            # Try to get best available price
+            price_data = {}
+            
+            # Check for valid (non-NaN, non-None) values
+            import math
+            
+            # Helper function to check if value is valid
+            def is_valid_price(value):
+                return value is not None and not math.isnan(value) and value > 0
+            
+            if is_valid_price(ticker.bid):
+                price_data['bid'] = float(ticker.bid)
+            if is_valid_price(ticker.ask):
+                price_data['ask'] = float(ticker.ask)
+            if is_valid_price(ticker.last):
+                price_data['last'] = float(ticker.last)
+            if is_valid_price(ticker.close):
+                price_data['close'] = float(ticker.close)
+            
+            # Calculate price from available data
+            if 'bid' in price_data and 'ask' in price_data:
+                # Best case: use bid/ask midpoint
+                price_data['price'] = (price_data['bid'] + price_data['ask']) / 2.0
+            elif 'last' in price_data:
+                # Use last trade price
+                price_data['price'] = price_data['last']
+            elif 'close' in price_data:
+                # Use previous close
+                price_data['price'] = price_data['close']
+            else:
+                # Try marketPrice() as last resort
+                market_price = ticker.marketPrice()
+                if is_valid_price(market_price):
+                    price_data['price'] = float(market_price)
+                else:
+                    print(f"⚠️ No valid price data for {symbol} - IBKR may require market data subscription")
+                    print(f"   This is common with Paper Trading accounts. Will fall back to yfinance.")
+                    # Cancel subscription before returning None
+                    self.ib.cancelMktData(contract)
+                    return None
+            
+            # Cancel market data subscription to clean up
+            self.ib.cancelMktData(contract)
+            
+            return price_data if price_data else None
+            
+        except Exception as e:
+            print(f"❌ Failed to get current price for {symbol}: {e}")
+            return None
+
+    def get_account_info(self, account_id: Optional[str] = None) -> Dict:
+        """Get account information (optionally for a specific account)"""
+        try:
+            self._ensure_event_loop()
+            self._ensure_connected()
+
+            account_id = account_id or self._get_default_account()
+
+            # Get account values (may include multiple accounts)
+            account_values = self.ib.accountValues()
+
             # Extract key values
             info = {}
+            NUMERIC_FIELDS = {
+                "BuyingPower",
+                "CashBalance",
+                "NetLiquidation",
+                "TotalCashValue",
+                "GrossPositionValue",
+                "AvailableFunds",
+            }
             for av in account_values:
+                # Skip other accounts when filtering
+                if account_id and getattr(av, "account", None) and av.account != account_id:
+                    continue
+
                 tag = av.tag
-                value = float(av.value) if av.value else 0.0
-                
+                raw_value = av.value
+                if tag in NUMERIC_FIELDS:
+                    try:
+                        value = float(raw_value) if raw_value not in (None, "") else 0.0
+                    except Exception:
+                        value = 0.0
+                else:
+                    value = raw_value  # keep as string for non-numeric fields
+
                 if tag == 'BuyingPower':
                     info['buying_power'] = value
                 elif tag == 'CashBalance':
@@ -359,15 +564,22 @@ class IBKRBroker:
                     info['total_cash'] = value
                 elif tag == 'GrossPositionValue':
                     info['portfolio_value'] = value
-            
-            # Set defaults if not found
+
             info.setdefault('buying_power', 0.0)
             info.setdefault('cash', 0.0)
             info.setdefault('equity', 0.0)
             info.setdefault('portfolio_value', 0.0)
-            
+
+            # include account id in result when available
+            if account_id:
+                info['account'] = account_id
+            else:
+                default_acc = self._get_default_account()
+                if default_acc:
+                    info['account'] = default_acc
+
             return info
-            
+
         except Exception as e:
             error_msg = str(e)
             if 'event loop' in error_msg.lower() or 'no current event loop' in error_msg.lower():
@@ -375,37 +587,11 @@ class IBKRBroker:
             else:
                 print(f"Failed to get account info: {e}")
             return {}
-    
-    def disconnect(self):
-        """Disconnect from TWS/IB Gateway"""
-        try:
-            if self.ib.isConnected():
-                self.ib.disconnect()
-                self._connected = False
-                print("Disconnected from IBKR")
-        except Exception as e:
-            print(f"Error disconnecting: {e}")
-    
-    def _convert_status(self, ibkr_status: str) -> str:
-        """Convert IBKR status to OrderStatus"""
-        mapping = {
-            'ApiPending': OrderStatus.PENDING.value,
-            'PendingSubmit': OrderStatus.PENDING.value,
-            'PendingCancel': OrderStatus.PENDING.value,
-            'PreSubmitted': OrderStatus.SUBMITTED.value,
-            'Submitted': OrderStatus.SUBMITTED.value,
-            'Filled': OrderStatus.FILLED.value,
-            'PartiallyFilled': OrderStatus.PARTIALLY_FILLED.value,
-            'Cancelled': OrderStatus.CANCELLED.value,
-            'ApiCancelled': OrderStatus.CANCELLED.value,
-            'Inactive': OrderStatus.REJECTED.value
-        }
-        return mapping.get(ibkr_status, OrderStatus.PENDING.value)
-    
+
     def __del__(self):
         """Cleanup on deletion"""
         try:
             if hasattr(self, 'ib') and self.ib.isConnected():
                 self.ib.disconnect()
-        except:
+        except Exception:
             pass
